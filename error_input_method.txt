@@ -1,0 +1,28 @@
+1. ROS를 사용해 데이터 전송
+ros2 > interface.py
+line 42~55 참고
+        # camera listenerl
+        self.lcam_subscription = self.create_subscription(
+            Point,
+            '/cam0',
+            self.lcam_listener_callback,
+            10)
+        self.lcam_subscription  # prevent unused variable warning
+        # camera listener2
+        self.rcam_subscription = self.create_subscription(
+            Point,
+            '/cam1',
+            self.rcam_listener_callback,
+            10)
+        self.rcam_subscription  # prevent unused variable warning
+
+/cma0와 /cam1로 pin_hole의 위치를 publish 픽셀이겠지?
+
+publish NODE를 키고 메인 프로그램 실행
+
+2. 변수에 바로 입력
+test.py 
+line 447
+                qtemp=self.topik.error2xd(self.agv.cartype, self.c_pos, self.agv.lcam_hole_pos, self.agv.rcam_hole_pos, 3)
+다른 프로그램 쓰레드를 추가 
+코드 모듈을 class robot에 추가, 인식 프로그램의 loop문을 def __init__에 쓰레드로 켜지도록 추가 

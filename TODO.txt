@@ -1,0 +1,4 @@
+TODO list for the quick setup. 
+
+1. check and match the motor ip address at servolist.py
+2. check and fix the mac address of bluetooth controller at evdev_controlthread. L9 -controller_address_2 
