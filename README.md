@@ -27,7 +27,7 @@ File discriptions
 12. test.py                          : clean code for control 7 motor control and comm via ros2 msgs. Main.
 13. controller/joy.py                : window xbox controller interface code.
 14. pitin_msgs.zip                   : ROS2 custom msg package for pitin agv. -> : ros 메시지로 ros관련 워크스페이스에 넣어서 빌드할 필요 존재!
-15. vision/                          : Vision model codes
+15. vision/calibration               : Camera sensor calibration codes (Intrinsic, Extrinsic)
 
 Xbox controller can be used for the manual control.
 
