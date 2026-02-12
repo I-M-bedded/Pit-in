@@ -279,23 +279,54 @@ class VisionTask(BaseTask):
             self.robot.topik.get_q(self.robot.c_pos)
             self.pto.compute_FK(self.robot.topik.q)
             zloc = self.pto.compute_FK_z(self.robot.topik.q)
-            print("FK Check:", self.pto.X0, zloc[0])
+            print("FK Check:", self.pto.X0, zloc[0], self.robot.topik.cnt2m)
     
     def save_data(self):
+    # 1. 로봇 상태 및 순운동학(FK) 업데이트
         self.robot.topik.get_q(self.robot.c_pos)
-        filename = "Calibration_data.csv"
-        header = ["cx", "cy", "cz", "rx", "ry", "rz", "rq"]
-        cam = self.robot.agv.rcam_hole_pos
-        indices = [6,4]
-        robot_data = [self.robot.c_pos[i] for i in indices]
-        
         self.pto.compute_FK(self.robot.topik.q)
-        row_data = cam + self.pto.X1 + robot_data
+        robot_yaw = self.robot.c_pos[3]*self.robot.topik.cnt2m[3]
+        
+        # 3. 동적 마커 데이터 가져오기 (self.agv.detected_markers)
+        # {id: {'x':.., 'y':.., 'z':.., 'qx':.., 'qy':.., 'qz':.., 'qw':.., 'stamp':..}}
+        markers = self.robot.agv.detected_markers
+        sorted_ids = sorted(markers.keys())  # ID 순으로 정렬하여 일관성 유지
+        
+        # 데이터셋 구성 (최대 2개의 마커를 나란히 저장)
+        marker_data = []
+        for i in range(2):  # Marker 1, Marker 2 공간 확보
+            if i < len(sorted_ids):
+                m_id = sorted_ids[i]
+                m_info = markers[m_id]
+                marker_data += [m_id, m_info['x'], m_info['y'], m_info['z'], 
+                                m_info['qx'], m_info['qy'], m_info['qz'], m_info['qw']]
+            else:
+                # 감지된 마커가 2개 미만일 경우 빈칸(또는 0.0) 처리
+                marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+        # 4. 헤더 및 행 데이터 구성
+        # FK 포즈(X0) + 마커1 정보 + 마커2 정보 + 로봇 추가 데이터
+        header = [
+            "robot_x", "robot_y", "robot_th",
+            "m1_id", "m1_x", "m1_y", "m1_z", "m1_qx", "m1_qy", "m1_qz", "m1_qw",
+            "m2_id", "m2_x", "m2_y", "m2_z", "m2_qx", "m2_qy", "m2_qz", "m2_qw",
+        ]
+        
+        row_data = self.pto.X0 + [robot_yaw]+ marker_data
+
+        # 5. CSV 파일 저장
+        filename = "Calibration_data.csv"
+        file_exists = os.path.isfile(filename)
 
         with open(filename, 'a', newline='') as file:
             writer = csv.writer(file)
-            if file.tell() == 0:
+            # 파일이 비어있거나 존재하지 않을 때만 헤더 작성
+            if not file_exists or os.path.getsize(filename) == 0:
                 writer.writerow(header)
             writer.writerow(row_data)
+
+        print(f"[SUCCESS] Calibration data saved. Detected Markers: {sorted_ids}")
+
+
     
 

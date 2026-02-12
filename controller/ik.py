@@ -141,7 +141,7 @@ class Topik:
         """calculate jacobian matrix with given motor position
         J: Jacobian matrix of Lx, Ly, Rx, Ry
         """
-        self.J=np.array([[0.0, -1.0, np.cos(selgapf.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1], np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0,0.0],
+        self.J=np.array([[0.0, -1.0, np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1], np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0,0.0],
                         [-1.0, 0.0, -np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]-np.sin(self.qm[2]+self.qm[3])*self.d3[1], -np.sin(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],  
                         [0.0, -1.0, -np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, -np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0,0.0], 
                         [-1.0, 0.0, np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]+np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0,0.0]])
