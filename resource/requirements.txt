@@ -1,5 +1,0 @@
-numpy
-matplotlib
-pygame
-evdev
-requests
