@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
+from pathlib import Path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -861,28 +862,127 @@ def train_one_epoch(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. 사용 예시 (Quick Start)
+# 9. YOLOv8-seg 백본 래퍼
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_yolov8_seg_backbone(
+    model_name: str = "yolov8n-seg.pt",
+    feature_channels: int = 256,
+    extract_layer: int = 6,
+) -> nn.Module:
+    """
+    Ultralytics YOLOv8-seg 사전학습 가중치를 다운로드하고
+    백본(feature extractor) 부분만 추출하여 반환합니다.
+
+    YOLOv8-seg 모델 레이어 구조 (640×640 입력 기준):
+      ── Backbone ──
+      Layer 0: Conv   ch=16   stride=2   (Stem)
+      Layer 1: Conv   ch=32   stride=4
+      Layer 2: C2f    ch=32   stride=4
+      Layer 3: Conv   ch=64   stride=8
+      Layer 4: C2f    ch=64   stride=8   ← P3
+      Layer 5: Conv   ch=128  stride=16
+      Layer 6: C2f    ch=128  stride=16  ← P4 (기본 추출 지점)
+      Layer 7: Conv   ch=256  stride=32
+      Layer 8: C2f    ch=256  stride=32
+      Layer 9: SPPF   ch=256  stride=32  ← P5
+      ── Neck (FPN) ──
+      Layer 10-21: Upsample + Concat + C2f + Conv
+      ── Head ──
+      Layer 22: Segment
+
+    Args:
+        model_name      : Ultralytics 모델 이름 (기본: 'yolov8n-seg.pt')
+                          선택지: yolov8n/s/m/l/x-seg.pt
+        feature_channels: TD-DRP에서 기대하는 출력 채널 수 (기본: 256)
+        extract_layer   : 특징을 추출할 백본 레이어 인덱스 (기본: 6, P4)
+                          - 4: P3 (stride=8,  64ch) - 고해상도, 저수준 특징
+                          - 6: P4 (stride=16, 128ch) - 균형잡힌 특징 (권장)
+                          - 9: P5 (stride=32, 256ch) - 저해상도, 고수준 특징
+
+    Returns:
+        nn.Module : 입력 (B,3,H,W) → 출력 (B, feature_channels, H/stride, W/stride)
+    """
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        raise ImportError(
+            "ultralytics 패키지가 필요합니다. "
+            "'pip install ultralytics' 로 설치하세요."
+        )
+
+    print(f"[YOLOv8-seg] '{model_name}' 모델 로딩 중 (없으면 자동 다운로드)...")
+    yolo_model = YOLO(model_name)
+    print(f"[YOLOv8-seg] 모델 로딩 완료!")
+
+    # 백본 레이어 추출 (layer 0 ~ extract_layer)
+    backbone_layers = nn.Sequential(
+        *[yolo_model.model.model[i] for i in range(extract_layer + 1)]
+    )
+
+    # 추출된 레이어의 실제 출력 채널 확인
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, 64, 64)
+        out = backbone_layers(dummy)
+        actual_channels = out.shape[1]
+        actual_stride = 64 // out.shape[2]
+    print(f"[YOLOv8-seg] 백본 추출 완료: layer 0~{extract_layer}, "
+          f"ch={actual_channels}, stride={actual_stride}")
+
+    # 채널 수가 다르면 1×1 Conv 프로젝션 추가
+    if actual_channels != feature_channels:
+        print(f"[YOLOv8-seg] 채널 프로젝션: {actual_channels} → {feature_channels}")
+        projection = nn.Sequential(
+            nn.Conv2d(actual_channels, feature_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.ReLU(inplace=True),
+        )
+        backbone = nn.Sequential(backbone_layers, projection)
+    else:
+        backbone = backbone_layers
+
+    return backbone
+
+
+# 하위 호환용 별칭
+load_yolov8_backbone = load_yolov8_seg_backbone
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. 사용 예시 (Quick Start)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("TD-DRP v3+ Quick Start Demo")
+    print("TD-DRP v3+ Quick Start Demo (with Real YOLOv8-seg Backbone)")
     print("=" * 60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # ── 모델 초기화
+    # ── YOLOv8-seg 백본 다운로드 및 로딩
+    print("── YOLOv8-seg 백본 로딩 ──")
+    yolo_backbone = load_yolov8_seg_backbone(
+        model_name="yolov8n-seg.pt",   # seg nano 모델 (세그멘테이션 사전학습)
+        feature_channels=256,           # TD-DRP 기본 채널 수
+        extract_layer=6,                # P4 특징 맵 (stride=16, 균형잡힌 해상도)
+    )
+    print()
+
+    # ── 모델 초기화 (실제 YOLOv8 백본 사용)
     model = TDDRPv3Plus(
         feature_channels=256,
         illumination_channels=64,
         num_experts=3,
+        yolo_backbone=yolo_backbone,     # ← 실제 YOLOv8 백본 전달!
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable    = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"전체 파라미터: {total_params:,}")
-    print(f"학습 가능 파라미터 (Phase 1): {trainable:,}\n")
+    frozen       = total_params - trainable
+    print(f"전체 파라미터:              {total_params:,}")
+    print(f"학습 가능 파라미터 (Phase 1): {trainable:,}")
+    print(f"고정(Frozen) 파라미터:       {frozen:,}\n")
 
     # ── 더미 입력 생성
     B, H, W = 2, 256, 256
@@ -896,6 +996,9 @@ if __name__ == "__main__":
 
     outputs = model(I_aug, I_clean=I_clean)
     losses  = model.compute_loss(outputs, I_aug)
+
+    print(f"  특징 맵 F_prime 크기: {outputs['F_prime'].shape}")
+    print(f"  특징 맵 F_clean 크기: {outputs['F_clean'].shape}")
 
     losses["total"].backward()
     optimizer.step()
@@ -924,10 +1027,12 @@ if __name__ == "__main__":
     with torch.no_grad():
         test_img = torch.rand(1, 3, 640, 640).to(device)
         result   = model(test_img)
-        print(f"  입력 해상도:   {test_img.shape}")
+        print(f"  입력 해상도:     {test_img.shape}")
         print(f"  세그멘테이션 출력: {result['seg_logits'].shape}")
         print(f"  조명 임베딩 맵 Z: {result['Z'].shape}")
         print(f"  Expert 확률 맵 P: {result['P'].shape}")
+        print(f"  변조 특징 맵 F': {result['F_prime'].shape}")
 
-    print("\n✅ TD-DRP v3+ 구현 완료!")
-    print("   실제 사용 시 yolo_backbone 인자에 YOLOv8 백본을 전달하세요.")
+    print("\n✅ TD-DRP v3+ (Real YOLOv8-seg Backbone) 구현 완료!")
+    print(f"   사용된 백본: YOLOv8n-seg (P4 특징, stride=16)")
+    print(f"   다른 모델 사용 시: load_yolov8_seg_backbone('yolov8s-seg.pt') 등으로 변경")
