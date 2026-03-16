@@ -12,7 +12,7 @@ TD-DRP v3+ (Task-Driven Dynamic Routing with Feature-Consistency SSL)
 손실 함수:
   - L_YOLO    : Task-Driven Segmentation Loss
   - L_SSL     : Feature-Consistency (Teacher-Student MSE)
-  - L_Hist    : DHURE 기반 히스토그램 정규화
+  - L_Hist    : KDE Soft Histogram 기반 히스토그램 정규화
   - L_Smooth  : 조명 맵 공간 스무스 정규화
   - L_TV      : Total Variation 정규화
   - L_Orth    : Expert Orthogonality 정규화
@@ -173,32 +173,32 @@ class RSVFiLM(nn.Module):
 
     def forward(
         self,
-        F: torch.Tensor,  # YOLO 특징 맵
-        Z: torch.Tensor,  # 조명 임베딩 맵
-        P: torch.Tensor,  # Router 확률 맵
-    ) -> torch.Tensor:
+        feat: torch.Tensor,  # YOLO 특징 맵 (F → feat: torch.nn.functional F와 이름 충돌 방지)
+        Z: torch.Tensor,     # 조명 임베딩 맵
+        P: torch.Tensor,     # Router 확률 맵
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        B, C_feat, H_f, W_f = F.shape
+        B, C_feat, H_f, W_f = feat.shape
 
         # Z, P를 특징 맵 해상도에 맞게 업샘플링
         Z_up = F.interpolate(Z, size=(H_f, W_f), mode="bilinear", align_corners=False)
         P_up = F.interpolate(P, size=(H_f, W_f), mode="bilinear", align_corners=False)
 
         # K개 Expert의 Δγ, Δβ를 P로 가중합
-        delta_gamma = torch.zeros_like(F)  # (B, C_feat, H_f, W_f)
-        delta_beta  = torch.zeros_like(F)
+        delta_gamma = torch.zeros(B, C_feat, H_f, W_f, device=feat.device, dtype=feat.dtype)
+        delta_beta  = torch.zeros(B, C_feat, H_f, W_f, device=feat.device, dtype=feat.dtype)
 
         for k in range(self.num_experts):
             g_k = self.expert_gamma[k](Z_up)          # (B, C_feat, H_f, W_f)
             b_k = self.expert_beta[k](Z_up)            # (B, C_feat, H_f, W_f)
             w_k = P_up[:, k:k+1, :, :]                 # (B, 1, H_f, W_f) - 브로드캐스트용
 
-            delta_gamma += w_k * g_k
-            delta_beta  += w_k * b_k
+            delta_gamma = delta_gamma + w_k * g_k
+            delta_beta  = delta_beta  + w_k * b_k
 
         # 잔차 변조: F' = F ⊙ (1 + Δγ) + Δβ
-        F_prime = F * (1.0 + delta_gamma) + delta_beta
-        return F_prime
+        F_prime = feat * (1.0 + delta_gamma) + delta_beta
+        return F_prime, delta_gamma, delta_beta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,35 +233,104 @@ class FeatureConsistencySSLLoss(nn.Module):
         return F.mse_loss(F_aug_prime, F_clean.detach())  # Teacher는 역전파 차단
 
 
-class DHUREHistogramLoss(nn.Module):
+class KDESoftHistogramLoss(nn.Module):
     """
-    DHURE 기반 미분 가능 히스토그램 정규화 손실
+    KDE(Kernel Density Estimation) 기반 미분 가능 소프트 히스토그램 정규화 손실
 
-    보정된 특징의 밝기(채널 평균) 분포가 정상 범위를 벗어나지 않도록 규제합니다.
-    구체적으로, 변조 후 특징 맵 F'의 채널 평균이 F_clean의 통계와 일치하도록 유도합니다.
+    기존 DHUREHistogramLoss가 단순 평균·표준편차 비교만 수행하여
+    실제 분포 형상을 감지하지 못하는 문제를 해결합니다.
 
-    L_Hist = ‖μ(F'_aug) - μ(F_clean)‖² + ‖σ(F'_aug) - σ(F_clean)‖²
+    각 픽셀/특징 값 x에 대해 Gaussian RBF로 소프트 빈 할당:
+      h_b(x) = exp(-(x - μ_b)² / (2σ²))
+
+    이를 통해 F_aug_prime과 F_clean의 히스토그램을
+    완전 미분 가능한 방식으로 비교합니다.
+
+    과노출 제어 원리:
+      - 과노출 시 히스토그램이 상위 빈에 집중(skewed)
+      - KDE 히스토그램은 이러한 분포 왜곡을 미분 가능하게 포착
+      - F_clean의 정상 분포와 일치하도록 학습시켜 과노출 보정
+
+    Args:
+        num_bins    : 히스토그램 빈 수 (기본값: 64)
+        sigma       : Gaussian 커널 폭 (None이면 빈 간격의 절반으로 자동 설정)
+        value_range : 히스토그램 범위. None이면 입력으로부터 동적 계산
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        num_bins: int = 64,
+        sigma: Optional[float] = None,
+        value_range: Optional[Tuple[float, float]] = None,
+    ):
         super().__init__()
+        self.num_bins = num_bins
+        self.fixed_range = value_range
+
+        if value_range is not None:
+            lo, hi = value_range
+            centers = torch.linspace(lo, hi, num_bins)
+            self.register_buffer("centers", centers)
+            self.sigma = sigma if sigma is not None else (hi - lo) / (num_bins * 2)
+        else:
+            self.register_buffer("centers", None)
+            self._default_sigma = sigma
+
+    def _compute_centers_and_sigma(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, float]:
+        """입력 텐서로부터 동적으로 빈 중심과 sigma를 계산"""
+        if self.centers is not None:
+            return self.centers, self.sigma
+        lo = x.min().item()
+        hi = x.max().item()
+        # 약간의 여유(margin)를 줘서 경계 빈도 누락 방지
+        margin = (hi - lo) * 0.05 + 1e-6
+        lo -= margin
+        hi += margin
+        centers = torch.linspace(lo, hi, self.num_bins, device=x.device, dtype=x.dtype)
+        sigma = self._default_sigma if self._default_sigma is not None else (hi - lo) / (self.num_bins * 2)
+        return centers, sigma
+
+    def _soft_histogram(self, x: torch.Tensor, centers: torch.Tensor, sigma: float) -> torch.Tensor:
+        """
+        KDE 기반 소프트 히스토그램 계산
+
+        Args:
+            x       : 입력 텐서 (B, C, H, W)
+            centers : 빈 중심 좌표 (num_bins,)
+            sigma   : Gaussian 폭
+
+        Returns:
+            hist : 정규화된 히스토그램 (B, C, num_bins)
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        x_flat = x.reshape(B * C, N, 1)                           # (B*C, N, 1)
+        c = centers.reshape(1, 1, -1)                              # (1, 1, num_bins)
+
+        # Gaussian RBF soft assignment
+        diff = x_flat - c                                          # (B*C, N, num_bins)
+        weights = torch.exp(-0.5 * (diff / sigma) ** 2)            # (B*C, N, num_bins)
+
+        # 빈별 합산 → 정규화
+        hist = weights.sum(dim=1)                                  # (B*C, num_bins)
+        hist = hist / (hist.sum(dim=-1, keepdim=True) + 1e-8)     # L1 정규화
+        return hist.reshape(B, C, -1)                              # (B, C, num_bins)
 
     def forward(
         self,
         F_aug_prime: torch.Tensor,  # 변조된 특징 맵 (B, C, H, W)
         F_clean: torch.Tensor,      # 정상 특징 맵    (B, C, H, W)
     ) -> torch.Tensor:
-        # 채널별 평균 & 표준편차 계산
-        mu_aug   = F_aug_prime.mean(dim=[2, 3])   # (B, C)
-        mu_clean = F_clean.mean(dim=[2, 3])
+        # 두 텐서를 합쳐서 공통 빈 범위 결정
+        combined = torch.cat([F_aug_prime.detach(), F_clean.detach()], dim=0)
+        centers, sigma = self._compute_centers_and_sigma(combined)
 
-        std_aug   = F_aug_prime.std(dim=[2, 3]) + 1e-8
-        std_clean = F_clean.std(dim=[2, 3])     + 1e-8
+        hist_aug   = self._soft_histogram(F_aug_prime, centers, sigma)
+        hist_clean = self._soft_histogram(F_clean.detach(), centers, sigma)
 
-        loss_mean = F.mse_loss(mu_aug, mu_clean.detach())
-        loss_std  = F.mse_loss(std_aug, std_clean.detach())
-
-        return loss_mean + loss_std
+        return F.mse_loss(hist_aug, hist_clean)
 
 
 class IlluminationSmoothLoss(nn.Module):
@@ -394,7 +463,7 @@ class TDDRPLoss(nn.Module):
         self.set_phase(phase)
 
         self.ssl_loss    = FeatureConsistencySSLLoss()
-        self.hist_loss   = DHUREHistogramLoss()
+        self.hist_loss   = KDESoftHistogramLoss()
         self.smooth_loss = IlluminationSmoothLoss()
         self.tv_loss     = TotalVariationLoss()
         self.orth_loss   = ExpertOrthogonalityLoss()
@@ -433,7 +502,7 @@ class TDDRPLoss(nn.Module):
         # L_SSL: Feature-Consistency
         losses["ssl"] = self.lambda_ssl * self.ssl_loss(F_aug_prime, F_clean)
 
-        # L_Hist: DHURE 히스토그램
+        # L_Hist: KDE 소프트 히스토그램
         losses["hist"] = self.lambda_hist * self.hist_loss(F_aug_prime, F_clean)
 
         # L_Smooth: 조명 맵 스무스
@@ -444,19 +513,19 @@ class TDDRPLoss(nn.Module):
             tv = self.tv_loss(delta_gamma) + self.tv_loss(delta_beta)
             losses["tv"] = self.lambda_tv * tv
         else:
-            losses["tv"] = torch.tensor(0.0)
+            losses["tv"] = torch.tensor(0.0, device=F_aug_prime.device)
 
         # L_Orth: Expert 직교성
         if expert_weights is not None:
             losses["orth"] = self.lambda_orth * self.orth_loss(expert_weights)
         else:
-            losses["orth"] = torch.tensor(0.0)
+            losses["orth"] = torch.tensor(0.0, device=F_aug_prime.device)
 
         # L_YOLO: Task-Driven (Phase 2, 3)
         if yolo_loss is not None and self.lambda_yolo > 0:
             losses["yolo"] = self.lambda_yolo * yolo_loss
         else:
-            losses["yolo"] = torch.tensor(0.0)
+            losses["yolo"] = torch.tensor(0.0, device=F_aug_prime.device)
 
         losses["total"] = sum(losses.values())
         return losses
@@ -568,13 +637,14 @@ class TDDRPv3Plus(nn.Module):
     def get_expert_weights(self) -> torch.Tensor:
         """
         Orthogonality 손실 계산용 Expert 가중치 추출
-        각 Expert의 첫 번째 Conv 가중치를 (K, D) 형태로 반환
+        각 Expert의 전체 Conv 가중치 벡터를 (K, D) 형태로 반환
+        (기존: 채널 평균으로 정보 압축 → 개선: 전체 가중치 벡터 사용)
         """
         weights = []
         for expert in self.rsv_film.expert_gamma:
-            w = expert.weight.view(expert.weight.shape[0], -1)  # (C_feat, ...)
-            weights.append(w.mean(dim=1, keepdim=True))         # (C_feat, 1)
-        return torch.cat(weights, dim=1).t()                    # (K, C_feat)
+            w = expert.weight.reshape(-1)  # (C_feat * C_ill,) 전체 가중치 펼침
+            weights.append(w)
+        return torch.stack(weights, dim=0)  # (K, C_feat * C_ill)
 
     def forward(
         self,
@@ -605,13 +675,16 @@ class TDDRPv3Plus(nn.Module):
         outputs["Z"] = Z
         outputs["P"] = P
 
-        # ── Step 2: YOLO 특징 맵 추출 (Frozen)
-        with torch.no_grad():
-            F_aug = self.yolo_backbone(I)   # (B, C_feat, H/4, W/4)
+        # ── Step 2: YOLO 특징 맵 추출
+        # NOTE: torch.no_grad() 제거 — Phase 2·3에서 YOLO backbone grad 전파 필요
+        # Phase 1에서는 _freeze_yolo()로 requires_grad=False 설정되어 있으므로 안전
+        F_aug = self.yolo_backbone(I)   # (B, C_feat, H/4, W/4)
 
-        # ── Step 3: RSV-FiLM으로 특징 맵 변조
-        F_prime = self.rsv_film(F_aug, Z, P)  # (B, C_feat, H/4, W/4)
+        # ── Step 3: RSV-FiLM으로 특징 맵 변조 (delta_gamma, delta_beta도 반환)
+        F_prime, delta_gamma, delta_beta = self.rsv_film(F_aug, Z, P)
         outputs["F_prime"] = F_prime
+        outputs["delta_gamma"] = delta_gamma
+        outputs["delta_beta"] = delta_beta
 
         # ── Step 4: YOLO 헤드로 세그멘테이션
         seg_logits = self.yolo_head(F_prime)  # (B, 2, H/4, W/4)
@@ -641,17 +714,15 @@ class TDDRPv3Plus(nn.Module):
         """
         assert "F_clean" in outputs, "SSL 손실 계산을 위해 I_clean을 forward에 전달하세요."
 
-        # TV 손실용 변조 파라미터 재계산 (간략화: F_prime - F_aug 사용)
-        # 실제 구현에서는 RSV-FiLM에서 delta_gamma, delta_beta를 직접 반환
-        delta_approx = outputs["F_prime"] - self.yolo_backbone(I_aug).detach()
-
+        # RSV-FiLM에서 직접 반환된 실제 delta_gamma, delta_beta 사용
+        # (기존: F_prime - backbone(I_aug) 근사치 → 개선: 실제 변조 파라미터)
         return self.criterion(
             F_aug_prime    = outputs["F_prime"],
             F_clean        = outputs["F_clean"],
             Z              = outputs["Z"],
             I_aug          = I_aug,
-            delta_gamma    = delta_approx,
-            delta_beta     = delta_approx,
+            delta_gamma    = outputs["delta_gamma"],
+            delta_beta     = outputs["delta_beta"],
             expert_weights = self.get_expert_weights(),
             yolo_loss      = yolo_loss,
         )
