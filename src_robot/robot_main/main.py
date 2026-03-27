@@ -11,7 +11,8 @@ from fastech import servo_state as ss
 from leadshine import agv_dummy as aj
 from controller import ik
 from config import RobotConfig
-from refactored_test.suprevisor import TopPlateSupervisor # Supervisor Import
+from suprevisor import TopPlateSupervisor # Supervisor Import
+from test.macro_micro import HybridController, ControlConfig as PBVSConfig
 
 if platform.system() == 'Linux':
     is_windows = False
@@ -46,6 +47,8 @@ class robot:
         self.topik = ik.Topik(self.config.version)
         self.pingap = ik.niro_gap
         self.ikmode = True
+        
+        self.pbvs_ctrl = HybridController(self.topik, PBVSConfig(version=self.config.version))
         
         # 3. Shared State
         self.c_pos = [0]*7

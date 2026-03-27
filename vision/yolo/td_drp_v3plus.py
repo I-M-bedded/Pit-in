@@ -1,5 +1,5 @@
 """
-TD-DRP v3+ (Task-Driven Dynamic Routing with Feature-Consistency SSL)
+TD-DRP v4 (Task-Driven Dynamic Routing with Feature-Consistency SSL)
 =====================================================================
 조명 변화 강건 비전 모델 - 산업용 이중 구멍 인식 특화
 

@@ -305,7 +305,7 @@ class VisionTask(BaseTask):
                 marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 
         # 4. 헤더 및 행 데이터 구성
-        # FK 포즈(X0) + 마커1 정보 + 마커2 정보 + 로봇 추가 데이터
+        # FK 포즈(X0) + 마커1 마커2 정보
         header = [
             "robot_x", "robot_y", "robot_th",
             "m1_id", "m1_x", "m1_y", "m1_z", "m1_qx", "m1_qy", "m1_qz", "m1_qw",
@@ -320,13 +320,67 @@ class VisionTask(BaseTask):
 
         with open(filename, 'a', newline='') as file:
             writer = csv.writer(file)
-            # 파일이 비어있거나 존재하지 않을 때만 헤더 작성
             if not file_exists or os.path.getsize(filename) == 0:
                 writer.writerow(header)
             writer.writerow(row_data)
 
         print(f"[SUCCESS] Calibration data saved. Detected Markers: {sorted_ids}")
 
+class PbvsTask(BaseTask):
+    """Macro-Micro PBVS Task using HybridController and Left Camera (/cam0)"""
+    def __init__(self, robot):
+        super().__init__(robot)
+        self.ctrl = robot.pbvs_ctrl
 
-    
+    def start(self):
+        if not self.is_active:
+            self.is_active = True
+            
+            # Use lcam_hole_pos from topics (camera frame error)
+            # We assume it represents the target error in meters. 
+            # We set tracking target based on current center position and camera error.
+            cam_err = self.robot.agv.lcam_hole_pos
+            bot_err = self.ctrl.vision.cam_to_robot(cam_err, side='left')
+            
+            # Target absolute position = current center + bot_err
+            current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
+            current_center = self.ctrl.kin.fk_center(current_q)
+            target_xy = current_center + bot_err[:2]
+            
+            self.ctrl.set_target(target_xy, cartype=self.robot.agv.cartype)
+            
+            self.robot.t_action = [0]*7
+            print(f"PBVS Task Started (Target: {target_xy})")
 
+    def run(self):
+        if not self.is_active: return
+        
+        # 1. Update current q_cmd to current actual if we get out of sync
+        # Here we just keep using the internal q_cmd in HybridController
+        
+        # 2. Get vision err
+        cam_err = self.robot.agv.lcam_hole_pos
+        bot_err = self.ctrl.vision.cam_to_robot(cam_err, side='left')
+        
+        # Calculate vision_xy by applying error to target
+        vision_xy = self.ctrl.target_xy - bot_err[:2]
+        
+        # 3. Step the PBVS controller
+        q_cnt = self.ctrl.step(current_vision_xy=vision_xy)
+        
+        # 4. Update servos
+        for i in range(7):
+            self.robot.t_action[i] = 0 # position mode
+            
+        # Copy calculated cnt positions to robot targets 
+        # (Exclude Z-pins as they are not controlled by PBVS right now)
+        self.robot.t_pos[0] = q_cnt[0]
+        self.robot.t_pos[1] = q_cnt[1]
+        self.robot.t_pos[2] = q_cnt[2]
+        self.robot.t_pos[3] = q_cnt[3]
+        self.robot.t_pos[4] = q_cnt[4]
+        
+        if self.ctrl.is_done:
+            print("PBVS Task Finished.")
+            self.robot.agv.op_state[0] = 255
+            self.reset()

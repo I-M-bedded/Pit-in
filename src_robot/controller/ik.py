@@ -100,8 +100,9 @@ class Topik:
 
 
     def fk(self):
-        """calculate forward kinematics with given motor position 
-            xc:return and update wing center posion in meter at robot base coordinate
+        """calculate forward kinematics with given motor position
+            Right-handed coordinate: index[0]=X(forward), index[1]=Y(left), index[2]=Z(up)
+            xc: wing center position in meter at robot base coordinate
             x: pin position in meter at robot base coordinate
             p2p: pin to pin distance
             so3_tp: rotation matrix of top plate
@@ -111,22 +112,22 @@ class Topik:
         Returns
             xc(array(2,3)): wing position in meter and robot base coordinate
         """
-        # left wing center
-        self.xc[0][0] = -self.qm[1]+np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.x0 #robot cord shift + plate shift + relative dist (L-shape)
-        self.xc[0][1] = -self.qm[0]+np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.y0 #x
+        # left wing center (RH: [0]=X_fwd, [1]=Y_left)
+        self.xc[0][0] = -self.qm[0]+np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.x0 # X forward
+        self.xc[0][1] = -self.qm[1]+np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.y0 # Y left
         self.xc[0][2] = self.qm[5]
         # right wing center
-        self.xc[1][0] = -self.qm[1]-np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.x0 #y
-        self.xc[1][1] = -self.qm[0]-np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.y0 #x
+        self.xc[1][0] = -self.qm[0]-np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.x0 # X forward
+        self.xc[1][1] = -self.qm[1]-np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.y0 # Y left
         self.xc[1][2] = self.qm[6]
 
-        # left pin 
-        self.x[0][0] = self.xc[0][0]+np.sin(self.qm[2]+self.qm[3])*self.d3[1]
-        self.x[0][1] = self.xc[0][1]+np.cos(self.qm[2]+self.qm[3])*self.d3[1]
-        self.x[0][2] = self.xc[0][2]    
+        # left pin
+        self.x[0][0] = self.xc[0][0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1]
+        self.x[0][1] = self.xc[0][1]+np.sin(self.qm[2]+self.qm[3])*self.d3[1]
+        self.x[0][2] = self.xc[0][2]
         # right pin
-        self.x[1][0] = self.xc[1][0]-np.sin(self.qm[2]+self.qm[4])*self.d3[1]
-        self.x[1][1] = self.xc[1][1]-np.cos(self.qm[2]+self.qm[4])*self.d3[1]
+        self.x[1][0] = self.xc[1][0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1]
+        self.x[1][1] = self.xc[1][1]-np.sin(self.qm[2]+self.qm[4])*self.d3[1]
         self.x[1][2] = self.xc[1][2]
 
         self.p2p=np.sqrt((self.x[0][0]-self.x[1][0])**2+(self.x[0][1]-self.x[1][1])**2)
@@ -134,17 +135,17 @@ class Topik:
         self.so3_tp=self.rot_Z(self.qm2[2])
         self.so3_lcam=self.rot_Z(self.qm2[2]+self.qm2[3])
         self.so3_rcam=self.rot_Z(self.qm2[2]+self.qm2[4])
-        
+
         return self.xc
     
     def get_J(self):
         """calculate jacobian matrix with given motor position
-        J: Jacobian matrix of Lx, Ly, Rx, Ry
+        J: Jacobian matrix of [Lx, Ly, Rx, Ry] (right-handed)
         """
-        self.J=np.array([[0.0, -1.0, np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1], np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0,0.0],
-                        [-1.0, 0.0, -np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]-np.sin(self.qm[2]+self.qm[3])*self.d3[1], -np.sin(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],  
-                        [0.0, -1.0, -np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, -np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0,0.0], 
-                        [-1.0, 0.0, np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]+np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0,0.0]])
+        self.J=np.array([[-1.0, 0.0, -np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]-np.sin(self.qm[2]+self.qm[3])*self.d3[1], -np.sin(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
+                        [0.0, -1.0, np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1], np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
+                        [-1.0, 0.0, np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]+np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0],
+                        [0.0, -1.0, -np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, -np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0]])
 
     def cal_wing_angle(self, dis):
         """ calculate wing angle with given pin gap for symmetric condition
@@ -188,7 +189,8 @@ class Topik:
         return np.sqrt(pingap_v[0]**2+pingap_v[1]**2)
 
     def num_ik(self):
-        """calculate ik solution with given desired pin gap from xd. 
+        """calculate ik solution with given desired pin gap from xd (right-handed).
+        xd: [0]=X_forward, [1]=Y_left, [2]=Z
         qd: desired motor position in cnt
         qdm: desired motor position in meter and radian
         """
@@ -205,11 +207,12 @@ class Topik:
         else:
             self.qm[3]=-q3
             self.qm[4]=q3
-        # calculate q1 and q2 with given desired pin position annd q3 and q4
-        sq2=(self.xd[0][0]-self.xd[1][0])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
-        cq2=(self.xd[0][1]-self.xd[1][1])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
-        qd[0]=-self.xd[0][1]-sq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3]))+cq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3])) + self.y0
-        qd[1]=-self.xd[0][0]+sq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3]))+cq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.x0
+        # calculate q0(trY→X_fwd) and q1(trX→Y_left) with given desired pin position and q3,q4
+        # RH: sin(q2) = (Ly_diff)/(denom), cos(q2) = (Lx_diff)/(denom)
+        sq2=(self.xd[0][1]-self.xd[1][1])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
+        cq2=(self.xd[0][0]-self.xd[1][0])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
+        qd[0]=-self.xd[0][0]+cq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3]))-sq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.x0
+        qd[1]=-self.xd[0][1]+sq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3]))+cq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.y0
         qd[2]=np.arctan2(sq2,cq2)
         qd[3]=self.qm[3]
         qd[4]=self.qm[4]
