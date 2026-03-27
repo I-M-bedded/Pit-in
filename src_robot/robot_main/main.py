@@ -23,7 +23,10 @@ else:
 
 try: 
     from ros2 import interface as rif
-except ImportError: 
+    print("[SYSTEM] ROS2 Interface loaded successfully.")
+except ImportError as e: 
+    print(f"[WARNING] ROS2 Interface import failed: {e}")
+    print("[WARNING] The ROS2 background thread will NOT be started! Check if VSCode is using a venv without rclpy.")
     is_ros_if = False
 
 if is_windows:
@@ -120,9 +123,11 @@ class robot:
     
 
     def agv_planning_main(self):
+        print("\n[ROS2 THREAD] Starting rclpy initialization...")
         rif.rclpy.init(args=None)
         self.ros = rif.SrvreqSubscriber(self.agv, self.servo_states)
         self.thereadcheck[0] = 1
+        print("[ROS2 THREAD] Successfully spinning SrvreqSubscriber node! Subscribed to /cam0")
         try:
             rif.rclpy.spin(self.ros)
         finally:
