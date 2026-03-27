@@ -89,14 +89,12 @@ class Topik:
            q(array(7,)): motor position array in cnt. ex) [0,0,0,0,0,0,0]
         """
         self.q = q
-        self.qm = self.q*self.cnt2m
-        self.qm2[0]=-self.qm[0]
-        self.qm2[1]=-self.qm[1]
-        self.qm2[2]=-self.qm[2]
-        self.qm2[3]=-self.qm[3]
-        self.qm2[4]=-self.qm[4]
-        self.qm2[5]=self.qm[5]
-        self.qm2[6]=self.qm[6]
+        self.qm = self.q * self.cnt2m
+        # HW drives CW on +cnt. Math expects CCW on +theta.
+        # So we invert angles 2 (Base Z), 3 (Left wing Z), 4 (Right wing Z) to CCW
+        self.qm[2] = -self.qm[2]
+        self.qm[3] = -self.qm[3]
+        self.qm[4] = -self.qm[4]
 
 
     def fk(self):
@@ -132,9 +130,9 @@ class Topik:
 
         self.p2p=np.sqrt((self.x[0][0]-self.x[1][0])**2+(self.x[0][1]-self.x[1][1])**2)
 
-        self.so3_tp=self.rot_Z(self.qm2[2])
-        self.so3_lcam=self.rot_Z(self.qm2[2]+self.qm2[3])
-        self.so3_rcam=self.rot_Z(self.qm2[2]+self.qm2[4])
+        self.so3_tp = self.rot_Z(self.qm[2])
+        self.so3_lcam = self.rot_Z(self.qm[2] + self.qm[3])
+        self.so3_rcam = self.rot_Z(self.qm[2] + self.qm[4])
 
         return self.xc
     
@@ -218,6 +216,11 @@ class Topik:
         qd[4]=self.qm[4]
         qd[5]=self.xd[0][2]
         qd[6]=self.xd[1][2]
+        
+        # Convert Math CCW angles back to HW CW angles
+        qd[2] = -qd[2]
+        qd[3] = -qd[3]
+        qd[4] = -qd[4]
         # update motor position in meter and radian
         self.qdm=qd
         # update motor position in cnt
