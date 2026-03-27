@@ -92,54 +92,47 @@ class VisionFeedback:
     Applies EMA low-pass filter for noise rejection.
     """
 
-    def __init__(self, alpha: float = 0.3):
+    def __init__(self, topik: ik.Topik, alpha: float = 0.3):
+        self.topik = topik
         self.alpha = alpha
-        self._filtered_err = np.zeros(2)  # [ex, ey] in robot frame
+        self._filtered_err = np.zeros(2)  # [ex, ey] pin-to-hole world error
         self._initialized = False
 
-        # Camera-to-robot rotation (right-handed, Z-up)
-        # Right camera: same orientation as robot base
-        self._R_rcam = np.eye(3)
-        # Left camera: 180° rotated about Z
-        self._R_lcam = np.array([[-1.0, 0.0, 0.0],
-                                  [0.0, -1.0, 0.0],
-                                  [0.0,  0.0, 1.0]])
+        # Camera is mounted on the Left Pin.
+        # It is rotated -90 degrees around Z relative to the pin's local frame
+        # rot_Z(-90) = [[0, 1, 0], [-1, 0, 0], [0, 0, 1]]
+        self._R_lcam_mount = np.array([[ 0.0,  1.0, 0.0],
+                                       [-1.0,  0.0, 0.0],
+                                       [ 0.0,  0.0, 1.0]])
+                                       
+        # Camera physical offset from the pin center (X=-5.7cm, Y=2.9cm)
+        self._offset_lcam = np.array([-0.057, 0.029, 0.0])
 
-    def set_camera_rotation(self, R_rcam: np.ndarray, R_lcam: np.ndarray):
-        """Override camera-to-robot rotation matrices if needed."""
-        self._R_rcam = R_rcam.copy()
-        self._R_lcam = R_lcam.copy()
-
-    def cam_to_robot(self, cam_err: np.ndarray, side: str = 'right') -> np.ndarray:
-        """Transform error from camera frame to robot base frame.
+    def get_pin_error(self, cam_err: np.ndarray, side: str = 'left') -> np.ndarray:
+        """Transform raw camera vision err into a pinpoint world tracking error.
         
         Args:
-            cam_err: [x, y, z] error in camera frame (meter)
+            cam_err: [x, y, z] target error in camera frame (meter)
             side: 'left' or 'right'
         
         Returns:
-            [x, y, z] error in robot base frame (right-handed)
+            world_err: [ex, ey] world frame error between Pin and Target Hole (m)
         """
-        R = self._R_rcam if side == 'right' else self._R_lcam
-        return R @ np.asarray(cam_err)
-
-    def update(self, target_pos: np.ndarray, current_pos: np.ndarray) -> np.ndarray:
-        """Compute filtered 2D position error in robot frame.
+        # Hole position in Pin's local coordinate frame
+        hole_local = self._offset_lcam + self._R_lcam_mount @ np.asarray(cam_err)
         
-        Args:
-            target_pos:  [x, y] target position in robot frame (m)
-            current_pos: [x, y] current position from vision (m)
-        
-        Returns:
-            filtered_err: [ex, ey] EMA-filtered error (m)
-        """
-        raw_err = np.asarray(target_pos[:2]) - np.asarray(current_pos[:2])
+        # Hole position offset in World coordinate frame
+        R_world_pin = self.topik.so3_lcam
+        hole_world_offset = np.asarray(R_world_pin @ hole_local).flatten()
+        return hole_world_offset[:2]
 
+    def update_error(self, raw_pin_err: np.ndarray) -> np.ndarray:
+        """Apply EMA filter to the world pin error."""
         if not self._initialized:
-            self._filtered_err = raw_err.copy()
+            self._filtered_err = raw_pin_err.copy()
             self._initialized = True
         else:
-            self._filtered_err = (self.alpha * raw_err
+            self._filtered_err = (self.alpha * raw_pin_err
                                   + (1.0 - self.alpha) * self._filtered_err)
 
         return self._filtered_err.copy()
@@ -266,7 +259,7 @@ class HybridController:
         self.topik = topik
         self.cfg = cfg
         self.kin = KinematicsSolver(topik)
-        self.vision = VisionFeedback(alpha=cfg.ema_alpha)
+        self.vision = VisionFeedback(topik=topik, alpha=cfg.ema_alpha)
 
         self.state = State.MACRO_APPROACH
         self._settle_timer: float = 0.0
@@ -396,10 +389,10 @@ class HybridController:
             self.state = State.PBVS_SERVOING
             self.vision.reset()
 
-    def _step_pbvs(self, vision_xy: np.ndarray):
+    def _step_pbvs(self, raw_pin_err: np.ndarray):
         """PBVS_SERVOING: Weighted visual servoing with discrete integration."""
         # Compute filtered error
-        err = self.vision.update(self.target_xy, vision_xy)
+        err = self.vision.update_error(raw_pin_err)
 
         # Check convergence
         if self.vision.error_norm < self.cfg.pbvs_threshold:

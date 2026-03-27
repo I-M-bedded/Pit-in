@@ -337,9 +337,9 @@ class PbvsTask(BaseTask):
             
             # Use lcam_hole_pos from topics (camera frame error)
             # We assume it represents the target error in meters. 
-            # We set tracking target based on current center position and camera error.
+            # Calculate world tracking error from current camera frame
             cam_err = self.robot.agv.lcam_hole_pos
-            bot_err = self.ctrl.vision.cam_to_robot(cam_err, side='left')
+            bot_err = self.ctrl.vision.get_pin_error(cam_err, side='left')
             
             # Target absolute position = current lpin + bot_err
             current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
@@ -357,15 +357,12 @@ class PbvsTask(BaseTask):
         # 1. Update current q_cmd to current actual if we get out of sync
         # Here we just keep using the internal q_cmd in HybridController
         
-        # 2. Get vision err
+        # 2. Get pinpoint world tracking error from camera
         cam_err = self.robot.agv.lcam_hole_pos
-        bot_err = self.ctrl.vision.cam_to_robot(cam_err, side='left')
+        world_pin_err = self.ctrl.vision.get_pin_error(cam_err, side='left')
         
-        # Calculate vision_xy by applying error to target
-        vision_xy = self.ctrl.target_xy - bot_err[:2]
-        
-        # 3. Step the PBVS controller
-        q_cnt = self.ctrl.step(current_vision_xy=vision_xy)
+        # 3. Step the PBVS controller directly with the error vector
+        q_cnt = self.ctrl.step(current_vision_xy=world_pin_err)
         
         # 4. Update servos
         for i in range(7):
