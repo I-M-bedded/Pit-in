@@ -12,7 +12,7 @@ from leadshine import agv_dummy as aj
 from controller import ik
 from config import RobotConfig
 from suprevisor import TopPlateSupervisor # Supervisor Import
-from test.macro_micro import HybridController, ControlConfig as PBVSConfig
+from robot_test.macro_micro import HybridController, ControlConfig as PBVSConfig
 
 if platform.system() == 'Linux':
     is_windows = False

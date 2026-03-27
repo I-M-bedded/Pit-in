@@ -275,10 +275,8 @@ class VisionTask(BaseTask):
         if inputs['L']:
             self.robot.topik.get_q(self.robot.c_pos)
             self.robot.topik.fk()
-            center_x = (self.robot.topik.x[0][0] + self.robot.topik.x[1][0]) / 2.0
-            center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
             zloc = self.robot.topik.x[0][2]
-            print("FK Check:", [center_x, center_y], zloc, self.robot.topik.cnt2m)
+            print("FK Check:", self.robot.topik.x[0][0], self.robot.topik.x[0][1], self.robot.topik.cnt2m)
     
     def save_data(self):
     # 1. 로봇 상태 및 순운동학(FK) 업데이트
