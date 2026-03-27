@@ -174,14 +174,14 @@ class KinematicsSolver:
         self.d2 = topik.d2
         self.d3 = topik.d3
 
-    def fk_center(self, qm: np.ndarray) -> np.ndarray:
-        """Compute center-of-pins position from joint values.
+    def fk_lpin(self, qm: np.ndarray) -> np.ndarray:
+        """Compute Left Pin position from joint values.
         
         Args:
             qm: [qm0..qm6] in (m, rad) — physical joint values
         
         Returns:
-            center: [x, y] in meter (right-handed)
+            lpin: [x, y] in meter (right-handed)
         """
         # Update topik internal state
         self.topik.qm = qm.copy()
@@ -196,10 +196,9 @@ class KinematicsSolver:
 
         self.topik.fk()
 
-        # Center of left and right pins
+        # Left pin coordinate
         lx, ly = self.topik.x[0][0], self.topik.x[0][1]
-        rx, ry = self.topik.x[1][0], self.topik.x[1][1]
-        return np.array([(lx + rx) / 2.0, (ly + ry) / 2.0])
+        return np.array([lx, ly])
 
     def jacobian_4dof(self, qm: np.ndarray) -> np.ndarray:
         """Compute 2×4 Jacobian for the 4-DOF subset.
@@ -221,15 +220,15 @@ class KinematicsSolver:
         self.topik.get_J()
         J_full = self.topik.J  # (4, 7): [Lx, Ly, Rx, Ry] × [qm0..qm6]
 
-        # Center Jacobian: dx_center = 0.5*(dLx+dRx), dy_center = 0.5*(dLy+dRy)
-        J_cx = 0.5 * (J_full[0, :] + J_full[2, :])  # d(center_x)/d(qm0..6)
-        J_cy = 0.5 * (J_full[1, :] + J_full[3, :])  # d(center_y)/d(qm0..6)
+        # Left Pin Jacobian: dx_lpin = dLx, dy_lpin = dLy
+        J_lx = J_full[0, :]  # d(Lx)/d(qm0..6)
+        J_ly = J_full[1, :]  # d(Ly)/d(qm0..6)
 
-        J_center = np.vstack([J_cx, J_cy])  # (2, 7)
+        J_lpin = np.vstack([J_lx, J_ly])  # (2, 7)
 
         # Extract 4-DOF columns: qm0(stageX), qm1(stageY), qm2(rtZ), qm3(Lw)
         cols = [0, 1, 2, 3]
-        return J_center[:, cols]  # (2, 4)
+        return J_lpin[:, cols]  # (2, 4)
 
     def weighted_pseudoinverse(self, J: np.ndarray, W_diag: np.ndarray) -> np.ndarray:
         """Compute weighted pseudo-inverse: W^{-1} J^T (J W^{-1} J^T)^{-1}.
@@ -332,12 +331,16 @@ class HybridController:
         xo = self.topik.xo_arr[self.topik.cartype]
         pin_gap_half = (xo[0][1] - xo[1][1]) / 2.0  # Y-axis half gap
 
-        # Construct desired left/right pin positions centered on target
+        # Set desired left/right pin positions
+        # Target IS the Left Pin destination.
         self.topik.xd[0][0] = target[0]
-        self.topik.xd[0][1] = target[1] + abs(pin_gap_half)
+        self.topik.xd[0][1] = target[1]
         self.topik.xd[0][2] = 0.0
+        
+        # Right Pin is offset from the Left Pin by twice the gap width along Y 
+        # (Y is Left, so Right Pin is -Y relative to Left Pin when q=0)
         self.topik.xd[1][0] = target[0]
-        self.topik.xd[1][1] = target[1] - abs(pin_gap_half)
+        self.topik.xd[1][1] = target[1] - abs(pin_gap_half * 2.0)
         self.topik.xd[1][2] = 0.0
 
         # Force stage to origin (0,0) for macro — arm does all the work
@@ -356,9 +359,9 @@ class HybridController:
 
         # Check if macro is close enough → transition
         qm_check = self.q_cmd.copy()
-        center = self.kin.fk_center(qm_check)
-        err = np.linalg.norm(center - self.target_xy)
-        print(f"[MACRO] target={self.target_xy}, center={center}, err={err:.4f}m")
+        lpin = self.kin.fk_lpin(qm_check)
+        err = np.linalg.norm(lpin - self.target_xy)
+        print(f"[MACRO] target={self.target_xy}, L-Pin={lpin}, err={err:.4f}m")
 
         if err < self.cfg.macro_threshold:
             print(f"[MACRO→MICRO] Macro approach complete, residual={err:.4f}m")
@@ -367,9 +370,9 @@ class HybridController:
 
     def _step_micro(self):
         """MICRO_APPROACH: Compensate residual error with XY stage."""
-        # Compute residual error from current q_cmd
-        center = self.kin.fk_center(self.q_cmd)
-        residual = self.target_xy - center
+        # Compute residual error from current q_cmd (Left Pin vs Target)
+        lpin = self.kin.fk_lpin(self.q_cmd)
+        residual = self.target_xy - lpin
 
         # Apply correction to stage only (lock arm joints)
         # Stage moves in opposite direction of residual (due to -qm mapping)
@@ -382,9 +385,9 @@ class HybridController:
         self.q_cmd[1] = np.clip(self.q_cmd[1], -stage_max, stage_max)
 
         # Re-check after correction
-        center = self.kin.fk_center(self.q_cmd)
-        err = np.linalg.norm(center - self.target_xy)
-        print(f"[MICRO] center={center}, err={err:.4f}m")
+        lpin = self.kin.fk_lpin(self.q_cmd)
+        err = np.linalg.norm(lpin - self.target_xy)
+        print(f"[MICRO] L-Pin={lpin}, err={err:.4f}m")
 
         # Wait for settling time
         elapsed = time.time() - self._settle_timer
@@ -561,10 +564,10 @@ def simulate_pbvs():
     vision_noise_std = 0.0002  # 0.2mm noise
 
     for i in range(max_iter):
-        # Simulate vision feedback (true position + noise)
-        true_center = ctrl.kin.fk_center(ctrl.q_cmd)
+        # Simulate vision feedback (true L-Pin position + noise)
+        true_lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
         noise = np.random.randn(2) * vision_noise_std
-        simulated_vision = true_center + noise
+        simulated_vision = true_lpin + noise
 
         # Step controller
         q_cnt = ctrl.step(current_vision_xy=simulated_vision)
@@ -577,21 +580,21 @@ def simulate_pbvs():
             break
 
         if (i + 1) % 10 == 0:
-            center = ctrl.kin.fk_center(ctrl.q_cmd)
-            err = np.linalg.norm(center - target_xy)
+            lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
+            err = np.linalg.norm(lpin - target_xy)
             print(f"  iter {i+1}: state={ctrl.state.name}, "
-                  f"center={center}, err={err:.6f}m")
+                  f"L-Pin={lpin}, err={err:.6f}m")
 
     # Final results
     print("\n" + "=" * 60)
     print("Final Results:")
-    final_center = ctrl.kin.fk_center(ctrl.q_cmd)
-    final_err = np.linalg.norm(final_center - target_xy)
+    final_lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
+    final_err = np.linalg.norm(final_lpin - target_xy)
     q_cnt = hw.q_to_cnt(ctrl.q_cmd)
 
     print(f"  State:    {ctrl.state.name}")
     print(f"  Target:   {target_xy}")
-    print(f"  Achieved: {final_center}")
+    print(f"  Achieved (L-Pin): {final_lpin}")
     print(f"  Error:    {final_err:.6f} m")
     print(f"  q_cmd(m,rad): {np.round(ctrl.q_cmd, 6)}")
     print(f"  q_cmd(cnt):   {q_cnt}")

@@ -341,10 +341,10 @@ class PbvsTask(BaseTask):
             cam_err = self.robot.agv.lcam_hole_pos
             bot_err = self.ctrl.vision.cam_to_robot(cam_err, side='left')
             
-            # Target absolute position = current center + bot_err
+            # Target absolute position = current lpin + bot_err
             current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
-            current_center = self.ctrl.kin.fk_center(current_q)
-            target_xy = current_center + bot_err[:2]
+            current_lpin = self.ctrl.kin.fk_lpin(current_q)
+            target_xy = current_lpin + bot_err[:2]
             
             self.ctrl.set_target(target_xy, cartype=self.robot.agv.cartype)
             
