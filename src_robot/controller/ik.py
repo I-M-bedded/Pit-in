@@ -112,22 +112,22 @@ class Topik:
         Returns
             xc(array(2,3)): wing position in meter and robot base coordinate
         """
-        # left wing center (RH: [0]=X_fwd, [1]=Y_left)
-        self.xc[0][0] = -self.qm[0]+np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.x0 # X forward
-        self.xc[0][1] = -self.qm[1]+np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.y0 # Y left
+        # left wing center (RH: [0]=X_fwd, [1]=Y_left) -> Left pin is -X (neg)
+        self.xc[0][0] = -self.qm[0] - np.cos(self.qm[2])*self.d2[1] + np.sin(self.qm[2])*self.d2[0] + self.x0 # X forward
+        self.xc[0][1] = -self.qm[1] - np.sin(self.qm[2])*self.d2[1] - np.cos(self.qm[2])*self.d2[0] + self.y0 # Y left
         self.xc[0][2] = self.qm[5]
-        # right wing center
-        self.xc[1][0] = -self.qm[0]-np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+self.x0 # X forward
-        self.xc[1][1] = -self.qm[1]-np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+self.y0 # Y left
+        # right wing center -> Right pin is +X (pos)
+        self.xc[1][0] = -self.qm[0] + np.cos(self.qm[2])*self.d2[1] - np.sin(self.qm[2])*self.d2[0] + self.x0 # X forward
+        self.xc[1][1] = -self.qm[1] + np.sin(self.qm[2])*self.d2[1] + np.cos(self.qm[2])*self.d2[0] + self.y0 # Y left
         self.xc[1][2] = self.qm[6]
 
         # left pin
-        self.x[0][0] = self.xc[0][0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1]
-        self.x[0][1] = self.xc[0][1]+np.sin(self.qm[2]+self.qm[3])*self.d3[1]
+        self.x[0][0] = self.xc[0][0] - np.cos(self.qm[2]+self.qm[3])*self.d3[1]
+        self.x[0][1] = self.xc[0][1] - np.sin(self.qm[2]+self.qm[3])*self.d3[1]
         self.x[0][2] = self.xc[0][2]
         # right pin
-        self.x[1][0] = self.xc[1][0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1]
-        self.x[1][1] = self.xc[1][1]-np.sin(self.qm[2]+self.qm[4])*self.d3[1]
+        self.x[1][0] = self.xc[1][0] + np.cos(self.qm[2]+self.qm[4])*self.d3[1]
+        self.x[1][1] = self.xc[1][1] + np.sin(self.qm[2]+self.qm[4])*self.d3[1]
         self.x[1][2] = self.xc[1][2]
 
         self.p2p=np.sqrt((self.x[0][0]-self.x[1][0])**2+(self.x[0][1]-self.x[1][1])**2)
@@ -142,10 +142,10 @@ class Topik:
         """calculate jacobian matrix with given motor position
         J: Jacobian matrix of [Lx, Ly, Rx, Ry] (right-handed)
         """
-        self.J=np.array([[-1.0, 0.0, -np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]-np.sin(self.qm[2]+self.qm[3])*self.d3[1], -np.sin(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
-                        [0.0, -1.0, np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[3])*self.d3[1], np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
-                        [-1.0, 0.0, np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]+np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0],
-                        [0.0, -1.0, -np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]-np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, -np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0]])
+        self.J=np.array([[-1.0, 0.0, np.sin(self.qm[2])*self.d2[1]+np.cos(self.qm[2])*self.d2[0]+np.sin(self.qm[2]+self.qm[3])*self.d3[1], np.sin(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
+                        [0.0, -1.0, -np.cos(self.qm[2])*self.d2[1]+np.sin(self.qm[2])*self.d2[0]-np.cos(self.qm[2]+self.qm[3])*self.d3[1], -np.cos(self.qm[2]+self.qm[3])*self.d3[1], 0.0, 0.0, 0.0],
+                        [-1.0, 0.0, -np.sin(self.qm[2])*self.d2[1]-np.cos(self.qm[2])*self.d2[0]-np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, -np.sin(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0],
+                        [0.0, -1.0, np.cos(self.qm[2])*self.d2[1]-np.sin(self.qm[2])*self.d2[0]+np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, np.cos(self.qm[2]+self.qm[4])*self.d3[1], 0.0, 0.0]])
 
     def cal_wing_angle(self, dis):
         """ calculate wing angle with given pin gap for symmetric condition
@@ -208,11 +208,11 @@ class Topik:
             self.qm[3]=-q3
             self.qm[4]=q3
         # calculate q0(trY→X_fwd) and q1(trX→Y_left) with given desired pin position and q3,q4
-        # RH: sin(q2) = (Ly_diff)/(denom), cos(q2) = (Lx_diff)/(denom)
-        sq2=(self.xd[0][1]-self.xd[1][1])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
-        cq2=(self.xd[0][0]-self.xd[1][0])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
-        qd[0]=-self.xd[0][0]+cq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3]))-sq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.x0
-        qd[1]=-self.xd[0][1]+sq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3]))+cq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.y0
+        # Since Right (xd[1]) is +X, Left (xd[0]) is -X, vector xd[1]-xd[0] points +X front.
+        sq2=(self.xd[1][1]-self.xd[0][1])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
+        cq2=(self.xd[1][0]-self.xd[0][0])/(2*self.d2[1]+2*self.d3[1]*np.cos(self.qm[3]))
+        qd[0]=-self.xd[0][0] - cq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3])) + sq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.x0
+        qd[1]=-self.xd[0][1] - sq2*(self.d2[1]+self.d3[1]*np.cos(self.qm[3])) - cq2*(self.d2[0]+self.d3[1]*np.sin(self.qm[3])) + self.y0
         qd[2]=np.arctan2(sq2,cq2)
         qd[3]=self.qm[3]
         qd[4]=self.qm[4]

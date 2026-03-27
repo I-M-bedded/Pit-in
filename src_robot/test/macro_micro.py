@@ -613,11 +613,13 @@ def test_coordinate_conversion():
     print(f"  Left pin:  x={topik.x[0][0]:.6f}, y={topik.x[0][1]:.6f} (RH: X=fwd, Y=left)")
     print(f"  Right pin: x={topik.x[1][0]:.6f}, y={topik.x[1][1]:.6f}")
     print(f"  Pin gap:   {topik.p2p:.6f}m")
-    # At q2=0, arm extends along X (forward) → x[0] should be large (cos-dominant)
-    assert abs(topik.x[0][0]) > 0.1, "X should be significant at q=0"
+    # At q2=0, arm extends along X (forward)
+    # With new FK, Right pin x[1] is at +X (Front), Left pin x[0] is at -X (Back)
+    assert topik.x[1][0] > 0.1, "Right pin X should be positive front at q=0"
+    assert topik.x[0][0] < -0.1, "Left pin X should be negative back at q=0"
     # Left-right symmetry: pins mirror about origin in X (x_L ≈ -x_R)
     assert abs(topik.x[0][0] + topik.x[1][0]) < 0.001, "Pins should be mirrored in X at symmetric q"
-    print("  ✓ At q=0, arm extends along X-forward (cos-dominant)")
+    print("  ✓ At q=0, Right pin is Front (+X), Left pin is Back (-X)")
     print("  ✓ Left/right pins mirrored symmetrically")
 
     # Test 2: Niro configuration — compute q from IK, then verify FK round-trip

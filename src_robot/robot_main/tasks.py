@@ -6,7 +6,6 @@ import csv
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../")
 try:
-    from sky import pos_target_oper
     from controller import ik
 except ImportError:
     pass
@@ -262,8 +261,6 @@ class ManualpinTask(BaseTask):
 class VisionTask(BaseTask):
     def __init__(self, robot):
         super().__init__(robot)
-        reacquire_rate = getattr(self.config, 'reacquire_rate', 100)
-        self.pto = pos_target_oper.pos_target_oper(self.config.version, reacquire_rate)
         self.Lx = []; self.Ly = []; self.Rx = []; self.Ry = []
         self.abs_error = [1e10]*2
         self.repeat_time = 0
@@ -272,19 +269,21 @@ class VisionTask(BaseTask):
 
     def run(self):
         inputs = self.robot.input_manager.get_state()
-        if (inputs['R'] and inputs['L']) or self.pto.target_mode:
+        if inputs['R'] and inputs['L']:
             pass 
 
         if inputs['L']:
             self.robot.topik.get_q(self.robot.c_pos)
-            self.pto.compute_FK(self.robot.topik.q)
-            zloc = self.pto.compute_FK_z(self.robot.topik.q)
-            print("FK Check:", self.pto.X0, zloc[0], self.robot.topik.cnt2m)
+            self.robot.topik.fk()
+            center_x = (self.robot.topik.x[0][0] + self.robot.topik.x[1][0]) / 2.0
+            center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
+            zloc = self.robot.topik.x[0][2]
+            print("FK Check:", [center_x, center_y], zloc, self.robot.topik.cnt2m)
     
     def save_data(self):
     # 1. 로봇 상태 및 순운동학(FK) 업데이트
         self.robot.topik.get_q(self.robot.c_pos)
-        self.pto.compute_FK(self.robot.topik.q)
+        self.robot.topik.fk()
         robot_yaw = self.robot.c_pos[3]*self.robot.topik.cnt2m[3]
         
         # 3. 동적 마커 데이터 가져오기 (self.agv.detected_markers)
@@ -312,7 +311,9 @@ class VisionTask(BaseTask):
             "m2_id", "m2_x", "m2_y", "m2_z", "m2_qx", "m2_qy", "m2_qz", "m2_qw",
         ]
         
-        row_data = self.pto.X0 + [robot_yaw]+ marker_data
+        center_x = (self.robot.topik.x[0][0] + self.robot.topik.x[1][0]) / 2.0
+        center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
+        row_data = [center_x, center_y] + [robot_yaw]+ marker_data
 
         # 5. CSV 파일 저장
         filename = "Calibration_data.csv"
