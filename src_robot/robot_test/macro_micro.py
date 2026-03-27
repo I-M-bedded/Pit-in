@@ -260,6 +260,8 @@ class HybridController:
         self.cfg = cfg
         self.kin = KinematicsSolver(topik)
         self.vision = VisionFeedback(topik=topik, alpha=cfg.ema_alpha)
+        # Instantiate hardware interface inside to access safety limits dynamically
+        self.hw = HardwareInterface(topik, cfg)
 
         self.state = State.MACRO_APPROACH
         self._settle_timer: float = 0.0
@@ -342,12 +344,32 @@ class HybridController:
 
         try:
             self.topik.num_ik()
-            self.q_cmd = self.topik.qdm.copy()
-            # Override stage commands to zero
+            required_q = self.topik.qdm.copy()
+            
+            # --- [DEBUG] Print required IK targets to resolve Macro Error ---
+            print(f"\n[MACRO DEBUG] Required IK Angles to reach target:")
+            print(f"  Stage X (trY_fwd) : {required_q[0]:.4f} m")
+            print(f"  Stage Y (trX_left): {required_q[1]:.4f} m")
+            print(f"  Base Rotation(rtZ): {np.rad2deg(required_q[2]):.2f} deg")
+            print(f"  L-Wing Angle(Lr)  : {np.rad2deg(required_q[3]):.2f} deg")
+            
+            # --- [UNREACHABLE CHECK] Validate against hardware limits ---
+            safe_q = self.hw.apply_safety_limits(required_q)
+            if not np.allclose(required_q[:5], safe_q[:5], atol=1e-3):
+                print(f"\n[ERROR] Target is UNREACHABLE!")
+                print(f"Required IK violates physical hardware safety limits. Escaping...")
+                print(f"  Required: {np.round(required_q[:5], 4)}")
+                print(f"  Clamped:  {np.round(safe_q[:5], 4)}")
+                self.state = State.DONE  # 루프 강제 탈출
+                return
+
+            self.q_cmd = required_q.copy()
+            # Override stage commands to zero (force Arm to do the work)
             self.q_cmd[0] = 0.0
             self.q_cmd[1] = 0.0
         except Exception as e:
             print(f"[MACRO] IK failed: {e}")
+            self.state = State.DONE
             return
 
         # Check if macro is close enough → transition
