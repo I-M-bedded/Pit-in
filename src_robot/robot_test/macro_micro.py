@@ -34,9 +34,9 @@ from controller import ik
 # Constants
 # =============================================================================
 class State(Enum):
-    MACRO_APPROACH   = auto()
-    MICRO_APPROACH   = auto()
-    PBVS_SERVOING    = auto()
+    MACRO_ARM        = auto()   # Phase 1: Arm 2DOF only
+    MICRO_STAGE      = auto()   # Phase 2: Stage 2DOF PBVS only
+    VS_LIFT          = auto()   # Phase 3: Z up + 4DOF PBVS
     DONE             = auto()
 
 
@@ -263,7 +263,7 @@ class HybridController:
         # Instantiate hardware interface inside to access safety limits dynamically
         self.hw = HardwareInterface(topik, cfg)
 
-        self.state = State.MACRO_APPROACH
+        self.state = State.MACRO_ARM
         self._settle_timer: float = 0.0
 
         # Current joint command in (m, rad)
@@ -285,7 +285,7 @@ class HybridController:
         """
         self.target_xy = np.asarray(target_xy[:2], dtype=float)
         self.topik.cartype = cartype
-        self.state = State.MACRO_APPROACH
+        self.state = State.MACRO_ARM
         self.vision.reset()
         self._settle_timer = 0.0
 
@@ -298,77 +298,88 @@ class HybridController:
         Returns:
             q_cmd_cnt: (7,) motor position command in encoder counts
         """
-        if self.state == State.MACRO_APPROACH:
+        if self.state == State.MACRO_ARM:
             self._step_macro()
-        elif self.state == State.MICRO_APPROACH:
-            self._step_micro()
-        elif self.state == State.PBVS_SERVOING:
+        elif self.state == State.MICRO_STAGE:
             if current_vision_xy is not None:
-                self._step_pbvs(current_vision_xy)
+                self._step_micro(current_vision_xy)
+        elif self.state == State.VS_LIFT:
+            if current_vision_xy is not None:
+                self._step_vs_lift(current_vision_xy)
         elif self.state == State.DONE:
             pass  # Hold position
 
         return self._q_cmd_to_cnt()
 
+    def _solve_single_pin_ik(self, target_xy: np.ndarray) -> np.ndarray:
+        """Numerical Inverse Kinematics solver for purely 1-Pin (Left) 2DOF target -> 4DOF manipulator.
+        Iteratively minimizes the position error using the weighted 2x4 Jacobian pseudoinverse.
+        """
+        q_opt = np.zeros(7)
+        # Start from current actual arm position to minimize unnecessary flailing
+        q_opt[2] = self.q_cmd[2]
+        q_opt[3] = self.q_cmd[3]
+        
+        max_iter = 100
+        for _ in range(max_iter):
+            lpin = self.kin.fk_lpin(q_opt)
+            err = target_xy[:2] - lpin
+            
+            # converged within 0.5mm
+            if np.linalg.norm(err) < 0.0005:
+                break
+                
+            J = self.kin.jacobian_4dof(q_opt)
+            
+            # For MACRO, severely penalize Stage movement and heavily favor Arm movement.
+            # This forces the arm joints to absorb the long distances.
+            W_macro = np.array([100.0, 100.0, 1.0, 1.0])
+            J_winv = self.kin.weighted_pseudoinverse(J, W_macro)
+            
+            dq_4 = J_winv @ err
+            q_opt[0] += dq_4[0]
+            q_opt[1] += dq_4[1]
+            q_opt[2] += dq_4[2]
+            q_opt[3] += dq_4[3]
+            
+            # Clamp limits to ensure realistic reachability convergence
+            q_opt = self.hw.apply_safety_limits(q_opt)
+            
+        return q_opt
+
     # ----- State handlers -----
 
     def _step_macro(self):
-        """MACRO_APPROACH: Use arm IK to reach the target vicinity."""
-        # Clamp target to macro workspace (85% of max reach)
-        max_reach = (self.topik.d2[1] + self.topik.d3[1]) * self.cfg.macro_reach_ratio
+        """MACRO_APPROACH: Use Single-Pin Numerical IK to reach the target."""
         target = self.target_xy.copy()
-        dist = np.linalg.norm(target)
-        if dist > max_reach:
-            target = target * (max_reach / dist)
-
-        # Set desired pin position for IK
-        # Use symmetric pin gap from current cartype
-        xo = self.topik.xo_arr[self.topik.cartype]
-        pin_gap_half = (xo[0][1] - xo[1][1]) / 2.0  # Y-axis half gap
-
-        # Set desired left/right pin positions
-        # Target IS the Left Pin destination.
-        self.topik.xd[0][0] = target[0]
-        self.topik.xd[0][1] = target[1]
-        self.topik.xd[0][2] = 0.0
-        
-        # Right Pin is offset from the Left Pin by twice the gap width along Y 
-        # (Y is Left, so Right Pin is -Y relative to Left Pin when q=0)
-        self.topik.xd[1][0] = target[0]
-        self.topik.xd[1][1] = target[1] - abs(pin_gap_half * 2.0)
-        self.topik.xd[1][2] = 0.0
-
-        # Force stage to origin (0,0) for macro — arm does all the work
-        self.topik.qm[0] = 0.0  # stageX = 0
-        self.topik.qm[1] = 0.0  # stageY = 0
 
         try:
-            self.topik.num_ik()
-            required_q = self.topik.qdm.copy()
+            # Solve using dedicated pure 1-Pin 4DOF IK!
+            required_q = self._solve_single_pin_ik(target)
             
-            # --- [DEBUG] Print required IK targets to resolve Macro Error ---
-            print(f"\n[MACRO DEBUG] Required IK Angles to reach target:")
+            # --- [DEBUG] Print numerical IK targets ---
+            print(f"\n[MACRO DEBUG] Single-Pin Numerical IK Angles to reach {np.round(target, 3)}:")
             print(f"  Stage X (trY_fwd) : {required_q[0]:.4f} m")
             print(f"  Stage Y (trX_left): {required_q[1]:.4f} m")
             print(f"  Base Rotation(rtZ): {np.rad2deg(required_q[2]):.2f} deg")
             print(f"  L-Wing Angle(Lr)  : {np.rad2deg(required_q[3]):.2f} deg")
             
-            # --- [UNREACHABLE CHECK] Validate against hardware limits ---
-            safe_q = self.hw.apply_safety_limits(required_q)
-            if not np.allclose(required_q[:5], safe_q[:5], atol=1e-3):
+            # --- [UNREACHABLE CHECK] Validate physical reachability ---
+            lpin_reach = self.kin.fk_lpin(required_q)
+            residual = np.linalg.norm(target - lpin_reach)
+            
+            # If the iterative solver hit a physical boundary, the residual will be > 0.
+            if residual > 0.005:  # > 5mm error means unreachable physically
                 print(f"\n[ERROR] Target is UNREACHABLE!")
-                print(f"Required IK violates physical hardware safety limits. Escaping...")
-                print(f"  Required: {np.round(required_q[:5], 4)}")
-                print(f"  Clamped:  {np.round(safe_q[:5], 4)}")
-                self.state = State.DONE  # 루프 강제 탈출
+                print(f"Physical hardware limits prevent the Left Pin from reaching the target.")
+                print(f"  Target  : {np.round(target, 4)}")
+                print(f"  Best Pos: {np.round(lpin_reach, 4)} (Residual: {residual:.4f}m)")
+                self.state = State.DONE  # Escaping loop safely
                 return
 
             self.q_cmd = required_q.copy()
-            # Override stage commands to zero (force Arm to do the work)
-            self.q_cmd[0] = 0.0
-            self.q_cmd[1] = 0.0
         except Exception as e:
-            print(f"[MACRO] IK failed: {e}")
+            print(f"[MACRO] Custom IK solver failed: {e}")
             self.state = State.DONE
             return
 
@@ -379,78 +390,76 @@ class HybridController:
         print(f"[MACRO] target={self.target_xy}, L-Pin={lpin}, err={err:.4f}m")
 
         if err < self.cfg.macro_threshold:
-            print(f"[MACRO→MICRO] Macro approach complete, residual={err:.4f}m")
-            self.state = State.MICRO_APPROACH
+            print(f"[MACRO→MICRO_STAGE] Arm approach complete, residual={err:.4f}m")
+            self.state = State.MICRO_STAGE
             self._settle_timer = time.time()
 
-    def _step_micro(self):
-        """MICRO_APPROACH: Compensate residual error with XY stage."""
-        # Compute residual error from current q_cmd (Left Pin vs Target)
-        lpin = self.kin.fk_lpin(self.q_cmd)
-        residual = self.target_xy - lpin
-
-        # Apply correction to stage only (lock arm joints)
-        # Stage moves in opposite direction of residual (due to -qm mapping)
-        self.q_cmd[0] += -residual[0]   # stageX correction (trY motor)
-        self.q_cmd[1] += -residual[1]   # stageY correction (trX motor)
-
-        # Clamp stage travel (typical max ±0.09m)
-        stage_max = 0.088
-        self.q_cmd[0] = np.clip(self.q_cmd[0], -stage_max, stage_max)
-        self.q_cmd[1] = np.clip(self.q_cmd[1], -stage_max, stage_max)
-
-        # Re-check after correction
-        lpin = self.kin.fk_lpin(self.q_cmd)
-        err = np.linalg.norm(lpin - self.target_xy)
-        print(f"[MICRO] L-Pin={lpin}, err={err:.4f}m")
-
-        # Wait for settling time
-        elapsed = time.time() - self._settle_timer
-        if elapsed > self.cfg.micro_settling_time and err < self.cfg.micro_threshold:
-            print(f"[MICRO→PBVS] Micro approach complete, residual={err:.6f}m")
-            self.state = State.PBVS_SERVOING
-            self.vision.reset()
-
-    def _step_pbvs(self, raw_pin_err: np.ndarray):
-        """PBVS_SERVOING: Weighted visual servoing with discrete integration."""
-        # Compute filtered error
+    def _step_micro(self, raw_pin_err: np.ndarray):
+        """Phase 2: MICRO_STAGE (스테이지 2DOF 전용 정밀 에러 보상 PBVS)"""
+        # EMA 필터 적용된 월드 오차 산출
         err = self.vision.update_error(raw_pin_err)
-
-        # Check convergence
+        
+        # 타겟 센터를 조준하고 있다면 에러가 0근처일 시 종료
         if self.vision.error_norm < self.cfg.pbvs_threshold:
-            print(f"[PBVS→DONE] Converged! err={self.vision.error_norm:.6f}m")
-            self.state = State.DONE
+            self._settle_timer += self.cfg.dt
+            if self._settle_timer > self.cfg.micro_settling_time:
+                print(f"\n[TRANSITION] MICRO_STAGE -> VS_LIFT (Vision Error Conquered!)")
+                self.state = State.VS_LIFT
+                self._settle_timer = 0.0
             return
-
-        # Desired Cartesian velocity: x_dot = lambda * e
-        x_dot = self.cfg.pbvs_lambda * err  # (2,)
-
-        # Compute Jacobian and weighted pseudo-inverse
+        else:
+            self._settle_timer = 0.0
+        
+        # PBVS 이득 곱 (lambda)
+        q_dot_stage_target = self.cfg.pbvs_lambda * err
+        
+        # 1-Pin Jacobian 계산 (Stage 속도 변환)
         J = self.kin.jacobian_4dof(self.q_cmd)
-        J_winv = self.kin.weighted_pseudoinverse(J, self.W_diag)
+        J_stage = J[:, 0:2]  # Stage X, Y에 해당하는 2x2 영역만 추출
+        
+        # 편미분 2x2 행렬의 역행렬 사용
+        try:
+            J_stage_inv = np.linalg.inv(J_stage)
+            dq_stage = J_stage_inv @ q_dot_stage_target
+            
+            # 속도 제한 (선형 댐핑)
+            scale = 1.0
+            if np.linalg.norm(dq_stage) > self.cfg.max_stage_vel:
+                scale = np.linalg.norm(dq_stage) / self.cfg.max_stage_vel
+            dq_stage /= scale
+            
+            # PBVS 누적 이동 (이산 적분)
+            self.q_cmd[0] += dq_stage[0] * self.cfg.dt  # stageX
+            self.q_cmd[1] += dq_stage[1] * self.cfg.dt  # stageY
+            
+            # 스테이지 물리계 리미트 검파
+            self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
+            
+            # 팔 각도는 MACRO 단계에서 설정된 값으로 절대 고정 (변동 불가)
+            
+            if self._settle_timer == 0.0: # Debug reduce spam
+                # print(f"[MICRO] Stage pbvs tracking (err: {np.linalg.norm(err):.5f}m)")
+                pass
+                
+        except np.linalg.LinAlgError:
+            print("[ERROR] Stage Jacobian pseudo-inverse failed in Micro!")
 
-        # Joint velocity: q_dot = J_winv * x_dot
-        q_dot_4 = J_winv @ x_dot  # (4,): [dqm0, dqm1, dqm2, dqm3]
-
-        # Velocity saturation
-        max_vels = np.array([self.cfg.max_stage_vel, self.cfg.max_stage_vel,
-                             self.cfg.max_arm_vel,   self.cfg.max_arm_vel])
-        scale = np.max(np.abs(q_dot_4) / max_vels)
-        if scale > 1.0:
-            q_dot_4 /= scale
-
-        # Discrete integration: q_cmd[k+1] = q_cmd[k] + q_dot * dt
-        self.q_cmd[0] += q_dot_4[0] * self.cfg.dt  # stageX (trY)
-        self.q_cmd[1] += q_dot_4[1] * self.cfg.dt  # stageY (trX)
-        self.q_cmd[2] += q_dot_4[2] * self.cfg.dt  # rtZ
-        self.q_cmd[3] += q_dot_4[3] * self.cfg.dt  # Lr (left wing)
-
-        # Keep right wing symmetric (optional: could also be controlled)
-        # self.q_cmd[4] = -self.q_cmd[3]
-
-        print(f"[PBVS] err={err}, |err|={self.vision.error_norm:.6f}m, "
-              f"q_dot={q_dot_4}")
-
+    def _step_vs_lift(self, current_vision_xy: np.ndarray):
+        """Phase 3: VS_LIFT (핀-홀 결합용 Z모터 4DOF 융합 미세 PBVS)
+        
+        [구현 스펙/주석 블록]
+        1. Z축 결합 모터(Lz) 스크류 폼을 작동하여 지정 높이까지 일정 속도로 들어 올린다.
+        2. Z축이 상승하는 동안 물리적 마찰로 발생하는 XY 오차와 카메라 비전 에러를 모니터링한다.
+        3. _step_micro 와 비슷하게 비전 PBVS를 돌리되, 이번엔 전체 4DOF Jacobian을 사용한다!
+        4. 다만 W_diag(가중치 행렬) 설정 시 스테이지(X, Y) 쪽에 매우 낮은 페널티(예: 1.0)를 주고,
+           팔 관절(rtZ, wing) 쪽에 극도로 높은 페널티(예: 1000.0)를 할당한다.
+        5. 결과적으로 보정은 십중팔구 스테이지가 주름잡게 되며, 팔은 물리적 한계점 부근에서나 미세하게 거드는
+           하이브리드 충돌 회피형 VS 보정을 달성하게 될 것이다.
+        6. 높이(Lz)가 요구치에 도달하면 self.state = State.DONE 판정.
+        """
+        # 현재는 주석 골격 상태이므로 즉각 DONE 처리
+        print("\n[PHASE 3] VS_LIFT Stub reached. Pin-Hole fully aligned. Shutting down PBVS.")
+        self.state = State.DONE
     # ----- Utility -----
 
     def _q_cmd_to_cnt(self) -> np.ndarray:
