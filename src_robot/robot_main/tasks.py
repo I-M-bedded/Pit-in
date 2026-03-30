@@ -276,7 +276,7 @@ class VisionTask(BaseTask):
             self.robot.topik.get_q(self.robot.c_pos)
             self.robot.topik.fk()
             zloc = self.robot.topik.x[0][2]
-            print("FK Check:", self.robot.topik.x[0][0], self.robot.topik.x[0][1], self.robot.topik.cnt2m)
+            print("FK Check:", self.robot.topik.x[0][0], self.robot.topik.x[0][1], self.robot.agv.lcam_hole_pos)
     
     def save_data(self):
     # 1. 로봇 상태 및 순운동학(FK) 업데이트
