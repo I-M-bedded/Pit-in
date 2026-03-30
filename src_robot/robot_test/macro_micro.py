@@ -46,6 +46,10 @@ class ControlConfig:
     # Robot version
     version: int = 4
 
+    # --- Phase Enable Flags (for debugging) ---
+    enable_macro: bool = True    # False → skip Phase 1, jump to Phase 2
+    enable_micro: bool = True    # False → skip Phase 2, jump to DONE
+
     # PBVS gain
     pbvs_lambda: float = 0.5
 
@@ -57,13 +61,13 @@ class ControlConfig:
     micro_threshold: float = 0.001     # 1mm for micro approach
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
-    # Macro workspace limit (fraction of max reach)
-    macro_reach_ratio: float = 0.85
-
     # Settling time after micro approach (sec)
     micro_settling_time: float = 0.5
 
-    # Weight matrix diagonal: [arm_rtZ, arm_wing, stageX, stageY]
+    # Stage travel limit from home (meter)
+    stage_limit: float = 0.07          # ±7cm
+
+    # Weight matrix diagonal: [stageX, stageY, arm_rtZ, arm_wing]
     # Large penalty on arm → stage preferred
     w_arm:   float = 1000.0
     w_stage: float = 1.0
@@ -74,9 +78,6 @@ class ControlConfig:
     # Joint velocity limits (rad/s for arm, m/s for stage)
     max_arm_vel:   float = 0.5    # rad/s
     max_stage_vel: float = 0.05   # m/s
-
-    # Unit conversion (from ik.Topik)
-    # m2cnt / cnt2m inherited from Topik instance
 
     # Motor velocity defaults (cnt/s)
     t_vel: List[int] = field(default_factory=lambda: [10000, 10000, 2000, 600, 600, 50000, 50000])
@@ -299,10 +300,18 @@ class HybridController:
             q_cmd_cnt: (7,) motor position command in encoder counts
         """
         if self.state == State.MACRO_ARM:
-            self._step_macro()
+            if self.cfg.enable_macro:
+                self._step_macro()
+            else:
+                print("[SKIP] Phase 1 MACRO_ARM disabled by config.")
+                self.state = State.MICRO_STAGE
         elif self.state == State.MICRO_STAGE:
-            if current_vision_xy is not None:
-                self._step_micro(current_vision_xy)
+            if self.cfg.enable_micro:
+                if current_vision_xy is not None:
+                    self._step_micro(current_vision_xy)
+            else:
+                print("[SKIP] Phase 2 MICRO_STAGE disabled by config.")
+                self.state = State.VS_LIFT
         elif self.state == State.VS_LIFT:
             if current_vision_xy is not None:
                 self._step_vs_lift(current_vision_xy)
@@ -311,99 +320,143 @@ class HybridController:
 
         return self._q_cmd_to_cnt()
 
-    def _solve_single_pin_ik(self, target_xy: np.ndarray) -> np.ndarray:
-        """Numerical Inverse Kinematics solver for purely 1-Pin (Left) 2DOF target -> 4DOF manipulator.
-        Iteratively minimizes the position error using the weighted 2x4 Jacobian pseudoinverse.
-        """
-        q_opt = np.zeros(7)
-        # Start from current actual arm position to minimize unnecessary flailing
-        q_opt[2] = self.q_cmd[2]
-        q_opt[3] = self.q_cmd[3]
+    # ----- Geometry Planner (Analytical 2-Link IK) -----
+
+    def _geometry_plan_arm(self, target_xy: np.ndarray) -> Tuple[float, float, bool]:
+        """Analytical 2-link planar arm IK for Left Pin.
         
-        max_iter = 100
-        for _ in range(max_iter):
-            lpin = self.kin.fk_lpin(q_opt)
-            err = target_xy[:2] - lpin
-            
-            # converged within 0.5mm
-            if np.linalg.norm(err) < 0.0005:
-                break
-                
-            J = self.kin.jacobian_4dof(q_opt)
-            
-            # For MACRO, severely penalize Stage movement and heavily favor Arm movement.
-            # This forces the arm joints to absorb the long distances.
-            W_macro = np.array([100.0, 100.0, 1.0, 1.0])
-            J_winv = self.kin.weighted_pseudoinverse(J, W_macro)
-            
-            dq_4 = J_winv @ err
-            q_opt[0] += dq_4[0]
-            q_opt[1] += dq_4[1]
-            q_opt[2] += dq_4[2]
-            q_opt[3] += dq_4[3]
-            
-            # Clamp limits to ensure realistic reachability convergence
-            q_opt = self.hw.apply_safety_limits(q_opt)
-            
-        return q_opt
+        FK chain (stage=0):
+          Wing Center = Base + Rot(rtZ) @ [-d2[1], -d2[0]]
+          Left Pin    = Wing Center + [-d3[1]*cos(rtZ+Lr), -d3[1]*sin(rtZ+Lr)]
+        
+        Equivalent 2-link arm:
+          L1 = sqrt(d2[0]² + d2[1]²)  ≈ 0.570m  (base → wing hinge)
+          L2 = d3[1]                   = 0.163m  (wing hinge → left pin)
+          φ_offset = atan2(-d2[0], -d2[1])        (d2 asymmetry correction)
+        
+        Returns:
+            (rtZ, Lr, clamped): rtZ and Lr in radians, clamped=True if unreachable
+        """
+        d2 = self.topik.d2  # [0.024, 0.5695]
+        d3_1 = self.topik.d3[1]  # 0.163
+        
+        L1 = np.sqrt(d2[0]**2 + d2[1]**2)
+        L2 = d3_1
+        phi_offset = np.arctan2(-d2[0], -d2[1])  # angle of d2 vector from base
+        
+        tx, ty = target_xy[0], target_xy[1]
+        r = np.sqrt(tx**2 + ty**2)  # distance from base to target
+        
+        clamped = False
+        
+        # --- Reachability check ---
+        r_max = L1 + L2
+        r_min = abs(L1 - L2)
+        
+        if r > r_max:
+            # Unreachable: clamp to max reach in target direction
+            clamped = True
+            r = r_max - 0.001  # tiny margin to avoid numerical edge
+        elif r < r_min:
+            clamped = True
+            r = r_min + 0.001
+        
+        # --- Law of cosines: solve elbow angle ---
+        cos_alpha = (L1**2 + L2**2 - r**2) / (2 * L1 * L2)
+        cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
+        alpha = np.arccos(cos_alpha)  # angle at wing hinge (internal)
+        
+        # --- Solve base angle (rtZ) ---
+        # angle from base to target
+        theta_target = np.arctan2(ty, tx)
+        
+        # angle offset due to L2
+        cos_beta = (L1**2 + r**2 - L2**2) / (2 * L1 * r)
+        cos_beta = np.clip(cos_beta, -1.0, 1.0)
+        beta = np.arccos(cos_beta)
+        
+        # rtZ = theta_target - beta - phi_offset  (elbow-down solution for left pin)
+        rtZ = theta_target - beta - phi_offset
+        
+        # Lr = pi - alpha (wing opening angle relative to base link)
+        Lr = -(np.pi - alpha)
+        
+        return rtZ, Lr, clamped
 
     # ----- State handlers -----
 
     def _step_macro(self):
-        """MACRO_APPROACH: Use Single-Pin Numerical IK to reach the target."""
+        """Phase 1: MACRO_ARM — Analytical Geometry Planner (2-Link IK)"""
         target = self.target_xy.copy()
-
+        
+        print("\n" + "="*60)
+        print("[PHASE 1] MACRO_ARM — Geometry Planner")
+        print("="*60)
+        
         try:
-            # Solve using dedicated pure 1-Pin 4DOF IK!
-            required_q = self._solve_single_pin_ik(target)
+            rtZ, Lr, clamped = self._geometry_plan_arm(target)
             
-            # --- [DEBUG] Print numerical IK targets ---
-            print(f"\n[MACRO DEBUG] Single-Pin Numerical IK Angles to reach {np.round(target, 3)}:")
-            print(f"  Stage X (trY_fwd) : {required_q[0]:.4f} m")
-            print(f"  Stage Y (trX_left): {required_q[1]:.4f} m")
-            print(f"  Base Rotation(rtZ): {np.rad2deg(required_q[2]):.2f} deg")
-            print(f"  L-Wing Angle(Lr)  : {np.rad2deg(required_q[3]):.2f} deg")
+            # Build q_cmd: stages locked at 0
+            required_q = np.zeros(7)
+            required_q[2] = rtZ
+            required_q[3] = Lr
             
-            # --- [UNREACHABLE CHECK] Validate physical reachability ---
+            # Apply joint safety limits
+            required_q = self.hw.apply_safety_limits(required_q)
+            
+            # FK verification
             lpin_reach = self.kin.fk_lpin(required_q)
             residual = np.linalg.norm(target - lpin_reach)
             
-            # If the iterative solver hit a physical boundary, the residual will be > 0.
-            if residual > 0.005:  # > 5mm error means unreachable physically
-                print(f"\n[ERROR] Target is UNREACHABLE!")
-                print(f"Physical hardware limits prevent the Left Pin from reaching the target.")
-                print(f"  Target  : {np.round(target, 4)}")
-                print(f"  Best Pos: {np.round(lpin_reach, 4)} (Residual: {residual:.4f}m)")
-                self.state = State.DONE  # Escaping loop safely
+            # --- Debug Report ---
+            print(f"  Target       : ({target[0]:.4f}, {target[1]:.4f}) m")
+            print(f"  rtZ (base)   : {np.rad2deg(required_q[2]):.2f} deg")
+            print(f"  Lr  (wing)   : {np.rad2deg(required_q[3]):.2f} deg")
+            print(f"  Stage        : LOCKED (0.0, 0.0) m")
+            print(f"  FK Verify    : ({lpin_reach[0]:.4f}, {lpin_reach[1]:.4f}) m")
+            print(f"  Residual     : {residual*1000:.2f} mm")
+            print(f"  Clamped      : {'YES (target beyond arm reach)' if clamped else 'NO'}")
+            
+            # If clamped AND residual > stage_limit, truly unreachable
+            if clamped and residual > self.cfg.stage_limit:
+                print(f"  [UNREACHABLE] Residual {residual*1000:.1f}mm > stage limit {self.cfg.stage_limit*1000:.0f}mm")
+                print(f"  Cannot reach target even with Stage compensation. Aborting.")
+                self.state = State.DONE
                 return
-
+            elif clamped:
+                print(f"  [CLAMPED→OK] Residual {residual*1000:.1f}mm within stage range. Stage will compensate.")
+            
+            # Commit
             self.q_cmd = required_q.copy()
-        except Exception as e:
-            print(f"[MACRO] Custom IK solver failed: {e}")
-            self.state = State.DONE
-            return
-
-        # Check if macro is close enough → transition
-        qm_check = self.q_cmd.copy()
-        lpin = self.kin.fk_lpin(qm_check)
-        err = np.linalg.norm(lpin - self.target_xy)
-        print(f"[MACRO] target={self.target_xy}, L-Pin={lpin}, err={err:.4f}m")
-
-        if err < self.cfg.macro_threshold:
-            print(f"[MACRO→MICRO_STAGE] Arm approach complete, residual={err:.4f}m")
+            
+            print(f"\n  [TRANSITION] MACRO_ARM → MICRO_STAGE")
             self.state = State.MICRO_STAGE
-            self._settle_timer = time.time()
+            self._settle_timer = 0.0
+            self.vision.reset()
+            
+        except Exception as e:
+            print(f"  [ERROR] Geometry planner failed: {e}")
+            import traceback; traceback.print_exc()
+            self.state = State.DONE
 
     def _step_micro(self, raw_pin_err: np.ndarray):
         """Phase 2: MICRO_STAGE (스테이지 2DOF 전용 정밀 에러 보상 PBVS)"""
         # EMA 필터 적용된 월드 오차 산출
         err = self.vision.update_error(raw_pin_err)
+        err_norm = self.vision.error_norm
         
-        # 타겟 센터를 조준하고 있다면 에러가 0근처일 시 종료
-        if self.vision.error_norm < self.cfg.pbvs_threshold:
+        # 수렴 판정
+        if err_norm < self.cfg.pbvs_threshold:
             self._settle_timer += self.cfg.dt
             if self._settle_timer > self.cfg.micro_settling_time:
-                print(f"\n[TRANSITION] MICRO_STAGE -> VS_LIFT (Vision Error Conquered!)")
+                print(f"\n{'='*60}")
+                print(f"[PHASE 2] MICRO_STAGE — CONVERGED!")
+                print(f"  Final Error  : {err_norm*1000:.3f} mm")
+                print(f"  Stage X      : {self.q_cmd[0]*1000:.2f} mm")
+                print(f"  Stage Y      : {self.q_cmd[1]*1000:.2f} mm")
+                print(f"  Settle Time  : {self._settle_timer:.2f} sec")
+                print(f"{'='*60}")
+                print(f"  [TRANSITION] MICRO_STAGE → VS_LIFT")
                 self.state = State.VS_LIFT
                 self._settle_timer = 0.0
             return
@@ -417,32 +470,30 @@ class HybridController:
         J = self.kin.jacobian_4dof(self.q_cmd)
         J_stage = J[:, 0:2]  # Stage X, Y에 해당하는 2x2 영역만 추출
         
-        # 편미분 2x2 행렬의 역행렬 사용
         try:
             J_stage_inv = np.linalg.inv(J_stage)
             dq_stage = J_stage_inv @ q_dot_stage_target
             
             # 속도 제한 (선형 댐핑)
-            scale = 1.0
-            if np.linalg.norm(dq_stage) > self.cfg.max_stage_vel:
-                scale = np.linalg.norm(dq_stage) / self.cfg.max_stage_vel
-            dq_stage /= scale
+            speed = np.linalg.norm(dq_stage)
+            if speed > self.cfg.max_stage_vel:
+                dq_stage *= self.cfg.max_stage_vel / speed
             
             # PBVS 누적 이동 (이산 적분)
-            self.q_cmd[0] += dq_stage[0] * self.cfg.dt  # stageX
-            self.q_cmd[1] += dq_stage[1] * self.cfg.dt  # stageY
+            self.q_cmd[0] += dq_stage[0] * self.cfg.dt
+            self.q_cmd[1] += dq_stage[1] * self.cfg.dt
             
-            # 스테이지 물리계 리미트 검파
+            # 스테이지 리미트 적용
             self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
             
-            # 팔 각도는 MACRO 단계에서 설정된 값으로 절대 고정 (변동 불가)
-            
-            if self._settle_timer == 0.0: # Debug reduce spam
-                # print(f"[MICRO] Stage pbvs tracking (err: {np.linalg.norm(err):.5f}m)")
-                pass
+            # --- Debug (매 10스텝에 1회 출력) ---
+            self._micro_step_count = getattr(self, '_micro_step_count', 0) + 1
+            if self._micro_step_count % 10 == 1:
+                print(f"  [MICRO #{self._micro_step_count:03d}] err={err_norm*1000:.2f}mm  "
+                      f"stgX={self.q_cmd[0]*1000:.1f}mm  stgY={self.q_cmd[1]*1000:.1f}mm")
                 
         except np.linalg.LinAlgError:
-            print("[ERROR] Stage Jacobian pseudo-inverse failed in Micro!")
+            print("[ERROR] Stage Jacobian inversion failed in Micro!")
 
     def _step_vs_lift(self, current_vision_xy: np.ndarray):
         """Phase 3: VS_LIFT (핀-홀 결합용 Z모터 4DOF 융합 미세 PBVS)
@@ -548,9 +599,10 @@ class HardwareInterface:
         """
         q_safe = q_cmd.copy()
 
-        # Stage limits (±88mm)
-        q_safe[0] = np.clip(q_safe[0], -0.088, 0.054)   # trY (X forward)
-        q_safe[1] = np.clip(q_safe[1], -0.063, 0.057)    # trX (Y left)
+        # Stage limits (±70mm from home)
+        sl = self.cfg.stage_limit  # 0.07m = 7cm
+        q_safe[0] = np.clip(q_safe[0], -sl, sl)   # trY (X forward)
+        q_safe[1] = np.clip(q_safe[1], -sl, sl)    # trX (Y left)
 
         # Rotation limit (±~18.6°)
         q_safe[2] = np.clip(q_safe[2], -0.325, 0.065)    # rtZ
