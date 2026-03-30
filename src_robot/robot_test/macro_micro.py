@@ -462,9 +462,14 @@ class HybridController:
         self.state = State.DONE
     # ----- Utility -----
 
-    def _q_cmd_to_cnt(self) -> np.ndarray:
-        """Convert q_cmd (m, rad) to encoder counts."""
-        cnt = np.zeros(7, dtype=int)
+    def _q_cmd_to_cnt(self) -> list:
+        """Convert q_cmd (m, rad) to encoder counts.
+        
+        Returns native Python int list (NOT numpy int64!)
+        because Fastech protocol.py calls position.to_bytes()
+        which only works on native Python int.
+        """
+        cnt = [0] * 7
         for i in range(7):
             cnt[i] = int(np.round(self.q_cmd[i] * self.topik.m2cnt[i]))
         return cnt
