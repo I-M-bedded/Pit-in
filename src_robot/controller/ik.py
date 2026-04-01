@@ -111,8 +111,8 @@ class Topik:
             xc(array(2,3)): wing position in meter and robot base coordinate
         """
         # left wing center (RH: [0]=X_fwd, [1]=Y_left) -> Left pin is -X (neg)
-        self.xc[0][0] = -self.qm[0] - np.cos(self.qm[2])*self.d2[1] + np.sin(self.qm[2])*self.d2[0] + self.x0 # X forward
-        self.xc[0][1] = -self.qm[1] - np.sin(self.qm[2])*self.d2[1] - np.cos(self.qm[2])*self.d2[0] + self.y0 # Y left
+        self.xc[0][0] = -self.qm[0] - np.cos(self.qm[2])*self.d2[1] - np.sin(self.qm[2])*self.d2[0] + self.x0 # X forward
+        self.xc[0][1] = -self.qm[1] - np.sin(self.qm[2])*self.d2[1] + np.cos(self.qm[2])*self.d2[0] + self.y0 # Y left
         self.xc[0][2] = self.qm[5]
         # right wing center -> Right pin is +X (pos)
         self.xc[1][0] = -self.qm[0] + np.cos(self.qm[2])*self.d2[1] - np.sin(self.qm[2])*self.d2[0] + self.x0 # X forward

@@ -111,7 +111,7 @@ class VisionFeedback:
         self._initialized = False
 
         # Camera is mounted on the Left Pin.
-        # It is rotated -90 degrees around Z relative to the pin's local frame
+        # Verified: rot_Z(-90) correctly maps camera (0.114, 0.072) to (-0.717, -0.061) in robot frame.
         # rot_Z(-90) = [[0, 1, 0], [-1, 0, 0], [0, 0, 1]]
         self._R_lcam_mount = np.array([[ 0.0,  1.0, 0.0],
                                        [-1.0,  0.0, 0.0],
@@ -377,7 +377,9 @@ class HybridController:
         
         L1 = np.sqrt(d2[0]**2 + d2[1]**2)
         L2 = d3_1
-        phi_offset = np.arctan2(-d2[0], -d2[1])  # angle of d2 vector from base
+        
+        # Left hinge is structurally forward (+Y), meaning +d2[0] relative to arm's -X direction.
+        phi_offset = np.arctan2(d2[0], -d2[1])  # angle of d2 vector from base
         
         tx, ty = target_xy[0], target_xy[1]
         r = np.sqrt(tx**2 + ty**2)  # distance from base to target
@@ -410,11 +412,18 @@ class HybridController:
         cos_beta = np.clip(cos_beta, -1.0, 1.0)
         beta = np.arccos(cos_beta)
         
-        # rtZ = theta_target - beta - phi_offset  (elbow-down solution for left pin)
+        # We select "Elbow IN" configuration (elbow stays near Y=0 for safety)
+        # rtZ = theta_target - beta - phi_offset
         rtZ = theta_target - beta - phi_offset
         
-        # Lr = pi - alpha (wing opening angle relative to base link)
-        Lr = -(np.pi - alpha)
+        # The angle of Link 2 (Lr) must account for the physical slant (phi_offset)
+        # of Link 1, because qm[3] rotates relative to the base frame's rotation (qm[2]),
+        # NOT relative to the physical slanted axis.
+        Lr = phi_offset - alpha
+        
+        # Normalize rtZ and Lr to [-pi, pi] to avoid large wrapping rotations
+        rtZ = (rtZ + np.pi) % (2 * np.pi) - np.pi
+        Lr = (Lr + np.pi) % (2 * np.pi) - np.pi
         
         return rtZ, Lr, clamped
 
