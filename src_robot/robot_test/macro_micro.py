@@ -624,13 +624,22 @@ class HybridController:
     def _q_cmd_to_cnt(self) -> list:
         """Convert q_cmd (m, rad) to encoder counts.
         
+        q_cmd is in MATH space (CCW = +).
+        HW motors use CW = + for rotation axes [2,3,4].
+        So we negate rotation axes here, mirroring get_q()'s read-path negation.
+        
         Returns native Python int list (NOT numpy int64!)
         because Fastech protocol.py calls position.to_bytes()
         which only works on native Python int.
         """
+        q_hw = self.q_cmd.copy()
+        # Math→HW: invert rotation axes (mirrors get_q's HW→Math negation)
+        q_hw[2] = -q_hw[2]
+        q_hw[3] = -q_hw[3]
+        q_hw[4] = -q_hw[4]
         cnt = [0] * 7
         for i in range(7):
-            cnt[i] = int(np.round(self.q_cmd[i] * self.topik.m2cnt[i]))
+            cnt[i] = int(np.round(q_hw[i] * self.topik.m2cnt[i]))
         return cnt
 
     @property
