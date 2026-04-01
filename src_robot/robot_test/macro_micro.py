@@ -59,21 +59,21 @@ class ControlConfig:
     dt: float = 0.1
 
     # Convergence thresholds (meter)
-    macro_threshold: float = 0.005     # 5mm for macro approach
-    micro_threshold: float = 0.003     # 1mm for micro final success
+    macro_threshold: float = 0.005    # 5mm for macro approach
+    micro_threshold: float = 0.003     # 3mm for micro final success
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
     # Settling / Wait Setting tolerances
     joint_settle_rad: float = 0.01     # 0.57 deg for arm joints
     stage_settle_m: float = 0.001      # 1mm for stage X, Y
-    settle_timeout: float = 20        # seconds before aborting wait
+    settle_timeout: float = 40        # seconds before aborting wait
 
     # Micro Observation Settings
     micro_obs_frames: int = 10         # Number of frames for mean/variance check
     micro_std_limit: float = 0.005     # Target variance std-dev limit (5mm)
 
     # Settling time after micro approach (sec)
-    micro_settling_time: float = 30
+    micro_settling_time: float = 300
 
     # Stage travel limit from home (meter)
     stage_limit: float = 0.075          # ±7cm
@@ -560,12 +560,19 @@ class HybridController:
         step_x = err_x * self.cfg.pbvs_lambda
         step_y = err_y * self.cfg.pbvs_lambda
         
+
+
         disp = np.hypot(step_x, step_y)
         max_disp = self.cfg.max_stage_vel * self.cfg.dt * self.cfg.micro_obs_frames
         if disp > max_disp:
             step_x *= max_disp / disp
             step_y *= max_disp / disp
-            
+        
+        if step_x < 0.005 :
+            step_x = err_x * 0.95
+        if step_y < 0.005 :
+            step_y = err_y * 0.95
+        
         print(f"  [MICRO OBS] Target Error: dX={err_x*1000:.1f}mm, dY={err_y*1000:.1f}mm")
         
         # [모터 축/부호 맵핑]
@@ -577,7 +584,7 @@ class HybridController:
         # (만약 X, Y 모터가 반대라면 이 두 줄의 step_x, step_y를 서로 바꿔주시면 됩니다)
         # (만약 움직임이 반대라면 += 대신 -= 로 바꿔주시면 됩니다)
         self.q_cmd[0] += step_x  # Axis 0 Translation
-        self.q_cmd[1] += step_y  # Axis 1 Translation
+        self.q_cmd[1] -= step_y  # Axis 1 Translation
         
         # Apply Safety Limits
         self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
