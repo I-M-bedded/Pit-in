@@ -60,23 +60,23 @@ class ControlConfig:
 
     # Convergence thresholds (meter)
     macro_threshold: float = 0.005     # 5mm for macro approach
-    micro_threshold: float = 0.001     # 1mm for micro final success
+    micro_threshold: float = 0.003     # 1mm for micro final success
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
     # Settling / Wait Setting tolerances
     joint_settle_rad: float = 0.05     # 2.8 deg for arm joints
     stage_settle_m: float = 0.001      # 1mm for stage X, Y
-    settle_timeout: float = 4.0        # seconds before aborting wait
+    settle_timeout: float = 20        # seconds before aborting wait
 
     # Micro Observation Settings
     micro_obs_frames: int = 10         # Number of frames for mean/variance check
     micro_std_limit: float = 0.005     # Target variance std-dev limit (5mm)
 
     # Settling time after micro approach (sec)
-    micro_settling_time: float = 0.5
+    micro_settling_time: float = 30
 
     # Stage travel limit from home (meter)
-    stage_limit: float = 0.07          # ±7cm
+    stage_limit: float = 0.075          # ±7cm
 
     # Weight matrix diagonal: [stageX, stageY, arm_rtZ, arm_wing]
     # Large penalty on arm → stage preferred

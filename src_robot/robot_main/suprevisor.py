@@ -46,9 +46,9 @@ class TopPlateSupervisor:
                     self.loading.start_approach()
                 elif (reqid == 0x131 and preset == 5) or (inputs['LT_PRESSED'] and inputs['X']):
                     self.loading.start_load()
-                # [Vision Pin Control via PBVS]
-                elif inputs['LT_PRESSED'] and inputs['Y']:
-                    self.pbvs.start()
+            # [Vision Pin Control via PBVS]
+            if inputs['LT_PRESSED'] and inputs['Y']:
+                self.pbvs.start()
 
             # [Manual Control] - 자동 작업 아닐 때만
             if not self.homing.is_active and not self.loading.is_active and not self.pbvs.is_active:
