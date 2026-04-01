@@ -19,9 +19,10 @@ class Topik:
         self.q = np.array([0, 0, 0, 0, 0, 0, 0])
         self.qm = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         self.qm2 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        
-        self.m2cnt = np.array([2000000.0, 2000000.0, 5000.0*self.nu/np.pi, 11250.0/np.pi, 11250.0/np.pi, 2000000.0, 2000000.0])
-        self.cnt2m = np.array([0.0000005, 0.0000005, 0.0002/self.nu*np.pi, 0.000088889*np.pi, 0.000088889*np.pi, 0.0000005, 0.0000005])
+        # index 3: Left Wing motor is physically inverted (+ cmd -> Rotates CW/+Y instead of CCW/-Y). 
+        # Negatives align it with standard mathematically CCW Cartesian frame.
+        self.m2cnt = np.array([2000000.0, 2000000.0, 5000.0*self.nu/np.pi, -11250.0/np.pi, 11250.0/np.pi, 2000000.0, 2000000.0])
+        self.cnt2m = np.array([0.0000005, 0.0000005, 0.0002/self.nu*np.pi, -0.000088889*np.pi, 0.000088889*np.pi, 0.0000005, 0.0000005])
         self.xc= np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
         self.x = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
         
