@@ -341,8 +341,11 @@ class PbvsTask(BaseTask):
             cam_err = self.robot.agv.lcam_hole_pos
             bot_err = self.ctrl.vision.get_pin_error(cam_err, side='left')
             
-            # Target absolute position = current lpin + bot_err
             current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
+            current_q[2] = -current_q[2]
+            current_q[3] = -current_q[3]
+            current_q[4] = -current_q[4]
+            
             current_lpin = self.ctrl.kin.fk_lpin(current_q)
             target_xy = current_lpin + bot_err[:2]
             

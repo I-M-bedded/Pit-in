@@ -64,7 +64,7 @@ class ControlConfig:
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
     # Settling / Wait Setting tolerances
-    joint_settle_rad: float = 0.015    # ~0.8 deg for arm joints
+    joint_settle_rad: float = 0.05     # 2.8 deg for arm joints
     stage_settle_m: float = 0.001      # 1mm for stage X, Y
     settle_timeout: float = 4.0        # seconds before aborting wait
 
