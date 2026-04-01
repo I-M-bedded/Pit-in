@@ -64,7 +64,7 @@ class ControlConfig:
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
     # Settling / Wait Setting tolerances
-    joint_settle_rad: float = 0.05     # 2.8 deg for arm joints
+    joint_settle_rad: float = 0.01     # 0.57 deg for arm joints
     stage_settle_m: float = 0.001      # 1mm for stage X, Y
     settle_timeout: float = 4.0        # seconds before aborting wait
 
@@ -549,38 +549,43 @@ class HybridController:
             self.state = State.VS_LIFT
             return
             
-        # 5. Discrete Output (Look and Move) Offset tracking
-        # calculate displacement offset directly.
-        J = self.kin.jacobian_4dof(self.q_cmd)
-        J_stage = J[:, 0:2]  # Extract 2x2 for Stage X, Y
+        # 5. 마이크로(Phase 2) 순수 Translation 위치 제어 (유저 피드백 반영)
+        # Jacobian(Visual Servoing)을 제거하고 계산된 world error(dx, dy)를 직접 stage 모터에 더합니다.
         
-        try:
-            J_stage_inv = np.linalg.inv(J_stage)
+        # mean_err = Target World - Current World (m)
+        err_x = mean_err[0]
+        err_y = mean_err[1]
+        
+        # 이동 속도/거리 제한
+        step_x = err_x * self.cfg.pbvs_lambda
+        step_y = err_y * self.cfg.pbvs_lambda
+        
+        disp = np.hypot(step_x, step_y)
+        max_disp = self.cfg.max_stage_vel * self.cfg.dt * self.cfg.micro_obs_frames
+        if disp > max_disp:
+            step_x *= max_disp / disp
+            step_y *= max_disp / disp
             
-            # Use pbvs_lambda as P-gain to avoid overshoot (0.5 means go halfway)
-            offset_stage = J_stage_inv @ (self.cfg.pbvs_lambda * mean_err)
-            
-            # Linear damp speed cap via max step displacement constraint
-            disp = np.linalg.norm(offset_stage)
-            max_disp_per_move = self.cfg.max_stage_vel * self.cfg.dt * self.cfg.micro_obs_frames
-            if disp > max_disp_per_move:
-                offset_stage *= max_disp_per_move / disp
-                
-            # Direct addition (No continuous integration loop)
-            self.q_cmd[0] += offset_stage[0]
-            self.q_cmd[1] += offset_stage[1]
-            
-            # Apply Safety Limits
-            self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
-            
-            print(f"  [MICRO MOVE] Applying Offset: dX={offset_stage[0]*1000:.1f}mm, dY={offset_stage[1]*1000:.1f}mm")
-            
-            self.state = State.WAIT_MICRO
-            self._settle_timer = 0.0
-            
-        except np.linalg.LinAlgError:
-            print("[ERROR] Stage Jacobian inversion failed in Micro!")
-            self.state = State.DONE
+        print(f"  [MICRO OBS] Target Error: dX={err_x*1000:.1f}mm, dY={err_y*1000:.1f}mm")
+        
+        # [모터 축/부호 맵핑]
+        # 이전에 "offset -5.1mm 에서 -x방향으로 계속 감" 현상이 있었음.
+        # 즉 FK의 (-부호) 역행렬 계산 때문에 모터가 반대로 도망가고 있었음.
+        # 여기서는 오차(Target-Current)를 직관적으로 더하기만 하면 타겟으로 다가갑니다.
+        
+        # index 0: Stage X? / index 1: Stage Y? 물리 매칭에 맞게 세팅
+        # (만약 X, Y 모터가 반대라면 이 두 줄의 step_x, step_y를 서로 바꿔주시면 됩니다)
+        # (만약 움직임이 반대라면 += 대신 -= 로 바꿔주시면 됩니다)
+        self.q_cmd[0] += step_x  # Axis 0 Translation
+        self.q_cmd[1] += step_y  # Axis 1 Translation
+        
+        # Apply Safety Limits
+        self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
+        
+        print(f"  [MICRO MOVE] Applied Offset (Math): 0축={step_x*1000:.1f}mm, 1축={step_y*1000:.1f}mm")
+        
+        self.state = State.WAIT_MICRO
+        self._settle_timer = 0.0
 
 
     def _step_wait_micro(self, actual_q: np.ndarray):
