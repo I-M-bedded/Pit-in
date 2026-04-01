@@ -290,15 +290,32 @@ class HybridController:
         self.vision.reset()
         self._settle_timer = 0.0
 
-    def step(self, current_vision_xy: Optional[np.ndarray] = None) -> np.ndarray:
+    def step(self, cam_raw: Optional[np.ndarray] = None,
+                   current_c_pos: Optional[np.ndarray] = None) -> list:
         """Execute one control step.
         
         Args:
-            current_vision_xy: [x, y] from vision system (for PBVS), or None
+            cam_raw: [x, y, z] raw camera observation from /cam0 (meter), or None
+            current_c_pos: [7] actual motor positions in encoder counts, or None
         
         Returns:
-            q_cmd_cnt: (7,) motor position command in encoder counts
+            q_cmd_cnt: [7] motor position command in encoder counts (native int)
         """
+        # --- FK 갱신: 실제 모터 위치로 so3_lcam 동기화 ---
+        if current_c_pos is not None:
+            actual_q = np.array(current_c_pos) * self.topik.cnt2m
+            # get_q의 부호 반전 로직 적용
+            actual_q[2] = -actual_q[2]
+            actual_q[3] = -actual_q[3]
+            actual_q[4] = -actual_q[4]
+            self.kin.fk_lpin(actual_q)  # topik.fk() 호출 → so3_lcam 최신화
+        
+        # --- 카메라 Raw → 월드 에러 변환 (최신 so3_lcam 사용) ---
+        world_pin_err = None
+        if cam_raw is not None:
+            world_pin_err = self.vision.get_pin_error(np.asarray(cam_raw))
+        
+        # --- State Machine ---
         if self.state == State.MACRO_ARM:
             if self.cfg.enable_macro:
                 self._step_macro()
@@ -307,14 +324,14 @@ class HybridController:
                 self.state = State.MICRO_STAGE
         elif self.state == State.MICRO_STAGE:
             if self.cfg.enable_micro:
-                if current_vision_xy is not None:
-                    self._step_micro(current_vision_xy)
+                if world_pin_err is not None:
+                    self._step_micro(world_pin_err)
             else:
                 print("[SKIP] Phase 2 MICRO_STAGE disabled by config.")
                 self.state = State.VS_LIFT
         elif self.state == State.VS_LIFT:
-            if current_vision_xy is not None:
-                self._step_vs_lift(current_vision_xy)
+            if world_pin_err is not None:
+                self._step_vs_lift(world_pin_err)
         elif self.state == State.DONE:
             pass  # Hold position
 

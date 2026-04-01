@@ -354,22 +354,18 @@ class PbvsTask(BaseTask):
     def run(self):
         if not self.is_active: return
         
-        # 1. Update current q_cmd to current actual if we get out of sync
-        # Here we just keep using the internal q_cmd in HybridController
+        # Pass raw camera data + actual motor positions to macro_micro
+        # macro_micro will handle FK update + cam→world transform internally
+        cam_raw = np.array(self.robot.agv.lcam_hole_pos, dtype=float)
+        c_pos = np.array(self.robot.c_pos, dtype=float)
         
-        # 2. Get pinpoint world tracking error from camera
-        cam_err = self.robot.agv.lcam_hole_pos
-        world_pin_err = self.ctrl.vision.get_pin_error(cam_err, side='left')
+        q_cnt = self.ctrl.step(cam_raw=cam_raw, current_c_pos=c_pos)
         
-        # 3. Step the PBVS controller directly with the error vector
-        q_cnt = self.ctrl.step(current_vision_xy=world_pin_err)
-        
-        # 4. Update servos
+        # Update servos
         for i in range(7):
-            self.robot.t_action[i] = 0 # position mode
+            self.robot.t_action[i] = 0  # position mode
             
-        # Copy calculated cnt positions to robot targets 
-        # (Exclude Z-pins as they are not controlled by PBVS right now)
+        # Copy calculated cnt positions to robot targets
         self.robot.t_pos[0] = q_cnt[0]
         self.robot.t_pos[1] = q_cnt[1]
         self.robot.t_pos[2] = q_cnt[2]
