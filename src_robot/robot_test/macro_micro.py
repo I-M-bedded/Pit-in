@@ -35,7 +35,9 @@ from controller import ik
 # =============================================================================
 class State(Enum):
     MACRO_ARM        = auto()   # Phase 1: Arm 2DOF only
-    MICRO_STAGE      = auto()   # Phase 2: Stage 2DOF PBVS only
+    WAIT_MACRO       = auto()   # Wait for MACRO_ARM to physically reach target
+    MICRO_STAGE      = auto()   # Phase 2: Observation (Look)
+    WAIT_MICRO       = auto()   # Phase 2: Stage action (Move)
     VS_LIFT          = auto()   # Phase 3: Z up + 4DOF PBVS
     DONE             = auto()
 
@@ -58,8 +60,17 @@ class ControlConfig:
 
     # Convergence thresholds (meter)
     macro_threshold: float = 0.005     # 5mm for macro approach
-    micro_threshold: float = 0.001     # 1mm for micro approach
+    micro_threshold: float = 0.001     # 1mm for micro final success
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
+
+    # Settling / Wait Setting tolerances
+    joint_settle_rad: float = 0.015    # ~0.8 deg for arm joints
+    stage_settle_m: float = 0.001      # 1mm for stage X, Y
+    settle_timeout: float = 4.0        # seconds before aborting wait
+
+    # Micro Observation Settings
+    micro_obs_frames: int = 10         # Number of frames for mean/variance check
+    micro_std_limit: float = 0.005     # Target variance std-dev limit (5mm)
 
     # Settling time after micro approach (sec)
     micro_settling_time: float = 0.5
@@ -289,6 +300,7 @@ class HybridController:
         self.state = State.MACRO_ARM
         self.vision.reset()
         self._settle_timer = 0.0
+        self._obs_buffer = []
 
     def step(self, cam_raw: Optional[np.ndarray] = None,
                    current_c_pos: Optional[np.ndarray] = None) -> list:
@@ -322,6 +334,9 @@ class HybridController:
             else:
                 print("[SKIP] Phase 1 MACRO_ARM disabled by config.")
                 self.state = State.MICRO_STAGE
+        elif self.state == State.WAIT_MACRO:
+            if current_c_pos is not None:
+                self._step_wait_macro(actual_q)
         elif self.state == State.MICRO_STAGE:
             if self.cfg.enable_micro:
                 if world_pin_err is not None:
@@ -329,6 +344,9 @@ class HybridController:
             else:
                 print("[SKIP] Phase 2 MICRO_STAGE disabled by config.")
                 self.state = State.VS_LIFT
+        elif self.state == State.WAIT_MICRO:
+            if current_c_pos is not None:
+                self._step_wait_micro(actual_q)
         elif self.state == State.VS_LIFT:
             if world_pin_err is not None:
                 self._step_vs_lift(world_pin_err)
@@ -446,71 +464,135 @@ class HybridController:
             # Commit
             self.q_cmd = required_q.copy()
             
-            print(f"\n  [TRANSITION] MACRO_ARM → MICRO_STAGE")
-            self.state = State.MICRO_STAGE
+            print(f"\n  [TRANSITION] MACRO_ARM → WAIT_MACRO")
+            self.state = State.WAIT_MACRO
             self._settle_timer = 0.0
-            self.vision.reset()
+            self._obs_buffer = []
             
         except Exception as e:
             print(f"  [ERROR] Geometry planner failed: {e}")
             import traceback; traceback.print_exc()
             self.state = State.DONE
 
-    def _step_micro(self, raw_pin_err: np.ndarray):
-        """Phase 2: MICRO_STAGE (스테이지 2DOF 전용 정밀 에러 보상 PBVS)"""
-        # EMA 필터 적용된 월드 오차 산출
-        err = self.vision.update_error(raw_pin_err)
-        err_norm = self.vision.error_norm
+    def _step_wait_macro(self, actual_q: np.ndarray):
+        """Phase 1.5: WAIT_MACRO — Wait for physical joints to reach target."""
+        if actual_q is None: return
         
-        # 수렴 판정
-        if err_norm < self.cfg.pbvs_threshold:
-            self._settle_timer += self.cfg.dt
-            if self._settle_timer > self.cfg.micro_settling_time:
-                print(f"\n{'='*60}")
-                print(f"[PHASE 2] MICRO_STAGE — CONVERGED!")
-                print(f"  Final Error  : {err_norm*1000:.3f} mm")
-                print(f"  Stage X      : {self.q_cmd[0]*1000:.2f} mm")
-                print(f"  Stage Y      : {self.q_cmd[1]*1000:.2f} mm")
-                print(f"  Settle Time  : {self._settle_timer:.2f} sec")
-                print(f"{'='*60}")
-                print(f"  [TRANSITION] MICRO_STAGE → VS_LIFT")
-                self.state = State.VS_LIFT
-                self._settle_timer = 0.0
-            return
-        else:
+        err_rtz = abs(self.q_cmd[2] - actual_q[2])
+        err_lr  = abs(self.q_cmd[3] - actual_q[3])
+        
+        self._settle_timer += self.cfg.dt
+        
+        if err_rtz < self.cfg.joint_settle_rad and err_lr < self.cfg.joint_settle_rad:
+            print(f"  [MACRO SETTLED] Arm reached target in {self._settle_timer:.2f}s.")
+            print(f"  [TRANSITION] WAIT_MACRO → MICRO_STAGE")
+            self.state = State.MICRO_STAGE
+            self._obs_buffer = []  # Clear vision buffer
+            self.vision.reset()    # EMA filter clear
             self._settle_timer = 0.0
+        elif self._settle_timer > self.cfg.settle_timeout:
+            print(f"  [TIMEOUT] Arm failed to settle. Error: rtZ={err_rtz:.3f}, Lr={err_lr:.3f}")
+            self.state = State.DONE
+
+    def _step_micro(self, raw_pin_err: np.ndarray):
+        """Phase 2: MICRO_STAGE — Discrete Observation (Look) and Offset Computation."""
         
-        # PBVS 이득 곱 (lambda)
-        q_dot_stage_target = self.cfg.pbvs_lambda * err
+        # 1. Gather raw errors
+        self._obs_buffer.append(raw_pin_err)
         
-        # 1-Pin Jacobian 계산 (Stage 속도 변환)
+        # Keep observing until we reach the required number of frames
+        if len(self._obs_buffer) < self.cfg.micro_obs_frames:
+            return
+            
+        # 2. We collected enough frames. Analyze.
+        obs_array = np.array(self._obs_buffer)
+        mean_err = np.mean(obs_array, axis=0)      # [dx, dy] mean
+        std_err = np.std(obs_array, axis=0)        # [dx, dy] std dev
+        max_std = np.max(std_err)
+        
+        # Clear buffer for the next observation cycle (if needed)
+        self._obs_buffer = []
+        
+        err_norm = np.linalg.norm(mean_err)
+        print(f"\n  [MICRO OBS] Err={err_norm*1000:.2f}mm, StdDev={max_std*1000:.2f}mm")
+        
+        # 3. Variance / Reliability Check
+        if max_std > self.cfg.micro_std_limit:
+            print(f"\n{'='*60}")
+            print(f"[ERROR] Target variance is too high (StdDev: {max_std*1000:.1f}mm)!")
+            print(f"  Suspicion: Camera Calibration Error or Kinematics (FK) Error.")
+            print(f"             Or physical collision shifting the stage/target.")
+            print(f"  Aborting for safety.")
+            print(f"{'='*60}")
+            self.state = State.DONE
+            return
+
+        # 4. Convergence Check
+        if err_norm < self.cfg.micro_threshold:
+            print(f"\n{'='*60}")
+            print(f"[PHASE 2] MICRO_STAGE — CONVERGED!")
+            print(f"  Final Error  : {err_norm*1000:.3f} mm")
+            print(f"  Stage X      : {self.q_cmd[0]*1000:.2f} mm")
+            print(f"  Stage Y      : {self.q_cmd[1]*1000:.2f} mm")
+            print(f"  Wait Time    : {self._settle_timer:.2f} sec")
+            print(f"{'='*60}")
+            print(f"  [TRANSITION] MICRO_STAGE → VS_LIFT")
+            self.state = State.VS_LIFT
+            return
+            
+        # 5. Discrete Output (Look and Move) Offset tracking
+        # calculate displacement offset directly.
         J = self.kin.jacobian_4dof(self.q_cmd)
-        J_stage = J[:, 0:2]  # Stage X, Y에 해당하는 2x2 영역만 추출
+        J_stage = J[:, 0:2]  # Extract 2x2 for Stage X, Y
         
         try:
             J_stage_inv = np.linalg.inv(J_stage)
-            dq_stage = J_stage_inv @ q_dot_stage_target
             
-            # 속도 제한 (선형 댐핑)
-            speed = np.linalg.norm(dq_stage)
-            if speed > self.cfg.max_stage_vel:
-                dq_stage *= self.cfg.max_stage_vel / speed
+            # Use pbvs_lambda as P-gain to avoid overshoot (0.5 means go halfway)
+            offset_stage = J_stage_inv @ (self.cfg.pbvs_lambda * mean_err)
             
-            # PBVS 누적 이동 (이산 적분)
-            self.q_cmd[0] += dq_stage[0] * self.cfg.dt
-            self.q_cmd[1] += dq_stage[1] * self.cfg.dt
+            # Linear damp speed cap via max step displacement constraint
+            disp = np.linalg.norm(offset_stage)
+            max_disp_per_move = self.cfg.max_stage_vel * self.cfg.dt * self.cfg.micro_obs_frames
+            if disp > max_disp_per_move:
+                offset_stage *= max_disp_per_move / disp
+                
+            # Direct addition (No continuous integration loop)
+            self.q_cmd[0] += offset_stage[0]
+            self.q_cmd[1] += offset_stage[1]
             
-            # 스테이지 리미트 적용
+            # Apply Safety Limits
             self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
             
-            # --- Debug (매 10스텝에 1회 출력) ---
-            self._micro_step_count = getattr(self, '_micro_step_count', 0) + 1
-            if self._micro_step_count % 10 == 1:
-                print(f"  [MICRO #{self._micro_step_count:03d}] err={err_norm*1000:.2f}mm  "
-                      f"stgX={self.q_cmd[0]*1000:.1f}mm  stgY={self.q_cmd[1]*1000:.1f}mm")
-                
+            print(f"  [MICRO MOVE] Applying Offset: dX={offset_stage[0]*1000:.1f}mm, dY={offset_stage[1]*1000:.1f}mm")
+            
+            self.state = State.WAIT_MICRO
+            self._settle_timer = 0.0
+            
         except np.linalg.LinAlgError:
             print("[ERROR] Stage Jacobian inversion failed in Micro!")
+            self.state = State.DONE
+
+
+    def _step_wait_micro(self, actual_q: np.ndarray):
+        """Phase 2.5: WAIT_MICRO — Wait for physical stage to reach new command."""
+        if actual_q is None: return
+        err_x = abs(self.q_cmd[0] - actual_q[0])
+        err_y = abs(self.q_cmd[1] - actual_q[1])
+        
+        self._settle_timer += self.cfg.dt
+        
+        if err_x < self.cfg.stage_settle_m and err_y < self.cfg.stage_settle_m:
+            # Let it mechanically bounce-settle for an extra 0.2 sec
+            if self._settle_timer >= 0.2:
+                # settled. Go back to Look phase.
+                self.state = State.MICRO_STAGE
+                self._obs_buffer = [] # Start fresh look
+                self.vision.reset()
+                self._settle_timer = 0.0
+        elif self._settle_timer > self.cfg.settle_timeout:
+            print(f"  [TIMEOUT] Stage failed to settle. Error: dX={err_x*1000:.1f}mm, dY={err_y*1000:.1f}mm")
+            self.state = State.DONE
 
     def _step_vs_lift(self, current_vision_xy: np.ndarray):
         """Phase 3: VS_LIFT (핀-홀 결합용 Z모터 4DOF 융합 미세 PBVS)
