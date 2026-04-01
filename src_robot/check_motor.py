@@ -3,7 +3,7 @@ import time
 import os
 
 # Append project path to use absolute imports
-sys.path.append('c:/Users/김병준/Documents/PitIn/Pit-in/')
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../")
 from src_robot.fastech import protocol as fs
 from src_robot.fastech import servolist as sl
 
