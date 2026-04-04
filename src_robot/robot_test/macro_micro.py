@@ -42,6 +42,37 @@ class State(Enum):
     DONE             = auto()
 
 
+# Side-dependent configuration for Left / Right pin
+SIDE_CFG = {
+    'left': {
+        'fk_idx': 0,                # topik.x[0] = Left pin
+        'wing_joint': 3,            # qm[3] = Lr
+        'z_motor': 5,               # qm[5] = Lz
+        'jac_rows': (0, 1),         # J rows: d(Lx)/dq, d(Ly)/dq
+        'jac_cols': [0, 1, 2, 3],   # stage X, Y + rtZ + Lr
+        'so3_attr': 'so3_lcam',
+        'cam_mount_R': np.array([[ 0.0,  1.0, 0.0],    # rot_Z(-90)
+                                  [-1.0,  0.0, 0.0],
+                                  [ 0.0,  0.0, 1.0]]),
+        'cam_offset': np.array([-0.057, 0.029, 0.0]),
+        'ik_sign': -1,              # d2, d3 extend in -cos direction
+    },
+    'right': {
+        'fk_idx': 1,                # topik.x[1] = Right pin
+        'wing_joint': 4,            # qm[4] = Rr
+        'z_motor': 6,               # qm[6] = Rz
+        'jac_rows': (2, 3),         # J rows: d(Rx)/dq, d(Ry)/dq
+        'jac_cols': [0, 1, 2, 4],   # stage X, Y + rtZ + Rr
+        'so3_attr': 'so3_rcam',
+        'cam_mount_R': np.array([[ 0.0, -1.0, 0.0],    # rot_Z(+90)
+                                  [ 1.0,  0.0, 0.0],
+                                  [ 0.0,  0.0, 1.0]]),
+        'cam_offset': np.array([0.057, -0.029, 0.0]),
+        'ik_sign': +1,              # d2, d3 extend in +cos direction
+    },
+}
+
+
 @dataclass
 class ControlConfig:
     """Control parameters for Macro-Micro PBVS system."""
@@ -98,43 +129,38 @@ class ControlConfig:
 # Module A: VisionFeedback
 # =============================================================================
 class VisionFeedback:
-    """ArUco marker / target 3D Pose estimation.
-    
-    Converts camera-frame error to robot-base-frame error (right-handed).
+    """Camera-frame error → robot-base-frame error converter.
+
+    Side-aware: uses SIDE_CFG for camera mount rotation, offset, and so3.
     Applies EMA low-pass filter for noise rejection.
     """
 
-    def __init__(self, topik: ik.Topik, alpha: float = 0.3):
+    def __init__(self, topik: ik.Topik, alpha: float = 0.3, side: str = 'left'):
         self.topik = topik
         self.alpha = alpha
-        self._filtered_err = np.zeros(2)  # [ex, ey] pin-to-hole world error
+        self._filtered_err = np.zeros(2)
         self._initialized = False
+        self.set_side(side)
 
-        # Camera is mounted on the Left Pin.
-        # Verified: rot_Z(-90) correctly maps camera (0.114, 0.072) to (-0.717, -0.061) in robot frame.
-        # rot_Z(-90) = [[0, 1, 0], [-1, 0, 0], [0, 0, 1]]
-        self._R_lcam_mount = np.array([[ 0.0,  1.0, 0.0],
-                                       [-1.0,  0.0, 0.0],
-                                       [ 0.0,  0.0, 1.0]])
-                                       
-        # Camera physical offset from the pin center (X=-5.7cm, Y=2.9cm)
-        self._offset_lcam = np.array([-0.057, 0.029, 0.0])
+    def set_side(self, side: str):
+        """Switch camera parameters for the given side."""
+        self.side = side
+        cfg = SIDE_CFG[side]
+        self._cam_mount_R = cfg['cam_mount_R']
+        self._cam_offset = cfg['cam_offset']
+        self._so3_attr = cfg['so3_attr']
 
-    def get_pin_error(self, cam_err: np.ndarray, side: str = 'left') -> np.ndarray:
-        """Transform raw camera vision err into a pinpoint world tracking error.
-        
+    def get_pin_error(self, cam_err: np.ndarray) -> np.ndarray:
+        """Transform raw camera error into world-frame pin-to-hole error.
+
         Args:
             cam_err: [x, y, z] target error in camera frame (meter)
-            side: 'left' or 'right'
-        
+
         Returns:
-            world_err: [ex, ey] world frame error between Pin and Target Hole (m)
+            world_err: [ex, ey] world frame error (m)
         """
-        # Hole position in Pin's local coordinate frame
-        hole_local = self._offset_lcam + self._R_lcam_mount @ np.asarray(cam_err)
-        
-        # Hole position offset in World coordinate frame
-        R_world_pin = self.topik.so3_lcam
+        hole_local = self._cam_offset + self._cam_mount_R @ np.asarray(cam_err)
+        R_world_pin = getattr(self.topik, self._so3_attr)
         hole_world_offset = np.asarray(R_world_pin @ hole_local).flatten()
         return hole_world_offset[:2]
 
@@ -179,61 +205,50 @@ class KinematicsSolver:
         self.d2 = topik.d2
         self.d3 = topik.d3
 
-    def fk_lpin(self, qm: np.ndarray) -> np.ndarray:
-        """Compute Left Pin position from joint values.
-        
-        Args:
-            qm: [qm0..qm6] in (m, rad) — physical joint values
-        
-        Returns:
-            lpin: [x, y] in meter (right-handed)
-        """
-        # Update topik internal state
+    def _sync_topik(self, qm: np.ndarray):
+        """Sync topik internal state from qm and run FK."""
         self.topik.qm = qm.copy()
-        # Zero out qm2 sign conventions used internally
-        self.topik.qm2[0] = -qm[0]
-        self.topik.qm2[1] = -qm[1]
-        self.topik.qm2[2] = -qm[2]
-        self.topik.qm2[3] = -qm[3]
-        self.topik.qm2[4] = -qm[4]
-        self.topik.qm2[5] =  qm[5]
-        self.topik.qm2[6] =  qm[6]
-
         self.topik.fk()
 
-        # Left pin coordinate
-        lx, ly = self.topik.x[0][0], self.topik.x[0][1]
-        return np.array([lx, ly])
+    def fk_pin(self, qm: np.ndarray, side: str = 'left') -> np.ndarray:
+        """Compute pin position from joint values.
 
-    def jacobian_4dof(self, qm: np.ndarray) -> np.ndarray:
-        """Compute 2×4 Jacobian for the 4-DOF subset.
-        
-        Maps q_dot = [dqm0(stageX), dqm1(stageY), dqm2(rtZ), dqm3(Lw)] 
-        → x_dot = [dx, dy] of center point.
-        
-        The full 4×7 Jacobian from Topik gives [dLx, dLy, dRx, dRy] / d[qm0..qm6].
-        Center Jacobian = 0.5*(J_left + J_right) projected to the 4-DOF columns.
-        
         Args:
             qm: [qm0..qm6] in (m, rad)
-        
+            side: 'left' or 'right'
+
+        Returns:
+            pin_xy: [x, y] in meter (right-handed)
+        """
+        self._sync_topik(qm)
+        idx = SIDE_CFG[side]['fk_idx']
+        return np.array([self.topik.x[idx][0], self.topik.x[idx][1]])
+
+    # backward compat alias
+    def fk_lpin(self, qm: np.ndarray) -> np.ndarray:
+        return self.fk_pin(qm, 'left')
+
+    def jacobian_4dof(self, qm: np.ndarray, side: str = 'left') -> np.ndarray:
+        """Compute 2x4 Jacobian for the 4-DOF subset (side-aware).
+
+        Columns: [stageX, stageY, rtZ, wing] where wing = Lr(left) or Rr(right).
+
+        Args:
+            qm: [qm0..qm6] in (m, rad)
+            side: 'left' or 'right'
+
         Returns:
             J_4dof: (2, 4) Jacobian matrix
         """
-        # Ensure FK is up-to-date
         self.topik.qm = qm.copy()
         self.topik.get_J()
-        J_full = self.topik.J  # (4, 7): [Lx, Ly, Rx, Ry] × [qm0..qm6]
+        J_full = self.topik.J  # (4, 7): [Lx, Ly, Rx, Ry] x [qm0..qm6]
 
-        # Left Pin Jacobian: dx_lpin = dLx, dy_lpin = dLy
-        J_lx = J_full[0, :]  # d(Lx)/d(qm0..6)
-        J_ly = J_full[1, :]  # d(Ly)/d(qm0..6)
+        r0, r1 = SIDE_CFG[side]['jac_rows']
+        J_pin = np.vstack([J_full[r0, :], J_full[r1, :]])  # (2, 7)
 
-        J_lpin = np.vstack([J_lx, J_ly])  # (2, 7)
-
-        # Extract 4-DOF columns: qm0(stageX), qm1(stageY), qm2(rtZ), qm3(Lw)
-        cols = [0, 1, 2, 3]
-        return J_lpin[:, cols]  # (2, 4)
+        cols = SIDE_CFG[side]['jac_cols']
+        return J_pin[:, cols]  # (2, 4)
 
     def weighted_pseudoinverse(self, J: np.ndarray, W_diag: np.ndarray) -> np.ndarray:
         """Compute weighted pseudo-inverse: W^{-1} J^T (J W^{-1} J^T)^{-1}.
@@ -271,10 +286,10 @@ class HybridController:
         self.topik = topik
         self.cfg = cfg
         self.kin = KinematicsSolver(topik)
-        self.vision = VisionFeedback(topik=topik, alpha=cfg.ema_alpha)
-        # Instantiate hardware interface inside to access safety limits dynamically
+        self.vision = VisionFeedback(topik=topik, alpha=cfg.ema_alpha, side='left')
         self.hw = HardwareInterface(topik, cfg)
 
+        self.side = 'left'
         self.state = State.MACRO_ARM
         self._settle_timer: float = 0.0
 
@@ -288,17 +303,28 @@ class HybridController:
         self.W_diag = np.array([cfg.w_stage, cfg.w_stage,
                                 cfg.w_arm,   cfg.w_arm])
 
-    def set_target(self, target_xy: np.ndarray, cartype: int = 0):
+    @property
+    def _wing_idx(self) -> int:
+        return SIDE_CFG[self.side]['wing_joint']
+
+    @property
+    def _z_idx(self) -> int:
+        return SIDE_CFG[self.side]['z_motor']
+
+    def set_target(self, target_xy: np.ndarray, side: str = 'left', cartype: int = 0):
         """Set the target position and initialize state machine.
-        
+
         Args:
             target_xy: [x, y] target in robot base frame (meter, RH)
+            side: 'left' or 'right'
             cartype: vehicle type index
         """
         self.target_xy = np.asarray(target_xy[:2], dtype=float)
+        self.side = side
         self.topik.cartype = cartype
-        self.state = State.MACRO_ARM
+        self.vision.set_side(side)
         self.vision.reset()
+        self.state = State.MACRO_ARM
         self._settle_timer = 0.0
         self._obs_buffer = []
 
@@ -313,16 +339,15 @@ class HybridController:
         Returns:
             q_cmd_cnt: [7] motor position command in encoder counts (native int)
         """
-        # --- FK 갱신: 실제 모터 위치로 so3_lcam 동기화 ---
+        # --- FK 갱신: 실제 모터 위치로 so3 동기화 ---
         if current_c_pos is not None:
             actual_q = np.array(current_c_pos) * self.topik.cnt2m
-            # get_q의 부호 반전 로직 적용
             actual_q[2] = -actual_q[2]
             actual_q[3] = -actual_q[3]
             actual_q[4] = -actual_q[4]
-            self.kin.fk_lpin(actual_q)  # topik.fk() 호출 → so3_lcam 최신화
-        
-        # --- 카메라 Raw → 월드 에러 변환 (최신 so3_lcam 사용) ---
+            self.kin.fk_pin(actual_q, self.side)
+
+        # --- 카메라 Raw → 월드 에러 변환 ---
         world_pin_err = None
         if cam_raw is not None:
             world_pin_err = self.vision.get_pin_error(np.asarray(cam_raw))
@@ -357,127 +382,120 @@ class HybridController:
 
     # ----- Geometry Planner (Analytical 2-Link IK) -----
 
-    def _geometry_plan_arm(self, target_xy: np.ndarray) -> Tuple[float, float, bool]:
-        """Analytical 2-link planar arm IK for Left Pin.
-        
-        FK chain (stage=0):
+    def _geometry_plan_arm(self, target_xy: np.ndarray, side: str = 'left') -> Tuple[float, float, bool]:
+        """Analytical 2-link planar arm IK (side-aware).
+
+        Left FK chain (stage=0):
           Wing Center = Base + Rot(rtZ) @ [-d2[1], -d2[0]]
           Left Pin    = Wing Center + [-d3[1]*cos(rtZ+Lr), -d3[1]*sin(rtZ+Lr)]
-        
-        Equivalent 2-link arm:
-          L1 = sqrt(d2[0]² + d2[1]²)  ≈ 0.570m  (base → wing hinge)
-          L2 = d3[1]                   = 0.163m  (wing hinge → left pin)
-          φ_offset = atan2(-d2[0], -d2[1])        (d2 asymmetry correction)
-        
+
+        Right FK chain (stage=0):
+          Wing Center = Base + Rot(rtZ) @ [+d2[1], -d2[0]]
+          Right Pin   = Wing Center + [+d3[1]*cos(rtZ+Rr), +d3[1]*sin(rtZ+Rr)]
+
         Returns:
-            (rtZ, Lr, clamped): rtZ and Lr in radians, clamped=True if unreachable
+            (rtZ, wing_angle, clamped): rtZ and Lr/Rr in radians
         """
         d2 = self.topik.d2  # [0.024, 0.5695]
         d3_1 = self.topik.d3[1]  # 0.163
-        
+        s = SIDE_CFG[side]['ik_sign']  # -1 for left, +1 for right
+
         L1 = np.sqrt(d2[0]**2 + d2[1]**2)
         L2 = d3_1
-        
-        # Left hinge is structurally forward (+Y), meaning +d2[0] relative to arm's -X direction.
-        phi_offset = np.arctan2(d2[0], -d2[1])  # angle of d2 vector from base
-        
+
+        # phi_offset: structural slant of d2 vector
+        #   Left:  arm extends -X → atan2(d2[0], -d2[1])
+        #   Right: arm extends +X → atan2(-d2[0], d2[1])
+        phi_offset = np.arctan2(-s * d2[0], s * d2[1])
+
         tx, ty = target_xy[0], target_xy[1]
-        r = np.sqrt(tx**2 + ty**2)  # distance from base to target
-        
+        r = np.sqrt(tx**2 + ty**2)
+
         clamped = False
-        
-        # --- Reachability check ---
         r_max = L1 + L2
         r_min = abs(L1 - L2)
-        
+
         if r > r_max:
-            # Unreachable: clamp to max reach in target direction
             clamped = True
-            r = r_max - 0.001  # tiny margin to avoid numerical edge
+            r = r_max - 0.001
         elif r < r_min:
             clamped = True
             r = r_min + 0.001
-        
-        # --- Law of cosines: solve elbow angle ---
+
+        # Law of cosines: elbow angle
         cos_alpha = (L1**2 + L2**2 - r**2) / (2 * L1 * L2)
         cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
-        alpha = np.arccos(cos_alpha)  # angle at wing hinge (internal)
-        
-        # --- Solve base angle (rtZ) ---
-        # angle from base to target
+        alpha = np.arccos(cos_alpha)
+
+        # Base angle
         theta_target = np.arctan2(ty, tx)
-        
-        # angle offset due to L2
         cos_beta = (L1**2 + r**2 - L2**2) / (2 * L1 * r)
         cos_beta = np.clip(cos_beta, -1.0, 1.0)
         beta = np.arccos(cos_beta)
-        
-        # We select "Elbow IN" configuration (elbow stays near Y=0 for safety)
-        # rtZ = theta_target - beta - phi_offset
-        rtZ = theta_target - beta - phi_offset
-        
-        # The angle of Link 2 (Lr) must account for the physical slant (phi_offset)
-        # of Link 1, because qm[3] rotates relative to the base frame's rotation (qm[2]),
-        # NOT relative to the physical slanted axis.
-        Lr = phi_offset - alpha
-        
-        # Normalize rtZ and Lr to [-pi, pi] to avoid large wrapping rotations
+
+        # Elbow configuration:
+        #   Left:  elbow-in → rtZ = theta - beta - phi
+        #   Right: elbow-in → rtZ = theta + beta - phi
+        rtZ = theta_target + s * beta - phi_offset
+
+        # Wing angle (relative to base rotation)
+        wing = phi_offset - s * alpha
+
+        # Normalize to [-pi, pi]
         rtZ = (rtZ + np.pi) % (2 * np.pi) - np.pi
-        Lr = (Lr + np.pi) % (2 * np.pi) - np.pi
-        
-        return rtZ, Lr, clamped
+        wing = (wing + np.pi) % (2 * np.pi) - np.pi
+
+        return rtZ, wing, clamped
 
     # ----- State handlers -----
 
     def _step_macro(self):
         """Phase 1: MACRO_ARM — Analytical Geometry Planner (2-Link IK)"""
         target = self.target_xy.copy()
-        
+        wi = self._wing_idx  # 3 (Lr) or 4 (Rr)
+
         print("\n" + "="*60)
-        print("[PHASE 1] MACRO_ARM — Geometry Planner")
+        print(f"[PHASE 1] MACRO_ARM — Geometry Planner ({self.side})")
         print("="*60)
-        
+
         try:
-            rtZ, Lr, clamped = self._geometry_plan_arm(target)
-            
-            # Build q_cmd: stages locked at 0
-            required_q = np.zeros(7)
+            rtZ, wing, clamped = self._geometry_plan_arm(target, self.side)
+
+            # Build q_cmd: stages locked at current, other wing untouched
+            required_q = self.q_cmd.copy()
+            required_q[0] = 0.0  # stage X
+            required_q[1] = 0.0  # stage Y
             required_q[2] = rtZ
-            required_q[3] = Lr
-            
-            # Apply joint safety limits
+            required_q[wi] = wing
+
             required_q = self.hw.apply_safety_limits(required_q)
-            
+
             # FK verification
-            lpin_reach = self.kin.fk_lpin(required_q)
-            residual = np.linalg.norm(target - lpin_reach)
-            
-            # --- Debug Report ---
+            pin_reach = self.kin.fk_pin(required_q, self.side)
+            residual = np.linalg.norm(target - pin_reach)
+
+            print(f"  Side         : {self.side}")
             print(f"  Target       : ({target[0]:.4f}, {target[1]:.4f}) m")
             print(f"  rtZ (base)   : {np.rad2deg(required_q[2]):.2f} deg")
-            print(f"  Lr  (wing)   : {np.rad2deg(required_q[3]):.2f} deg")
-            print(f"  Stage        : LOCKED (0.0, 0.0) m")
-            print(f"  FK Verify    : ({lpin_reach[0]:.4f}, {lpin_reach[1]:.4f}) m")
+            print(f"  Wing [q{wi}]  : {np.rad2deg(required_q[wi]):.2f} deg")
+            print(f"  FK Verify    : ({pin_reach[0]:.4f}, {pin_reach[1]:.4f}) m")
             print(f"  Residual     : {residual*1000:.2f} mm")
-            print(f"  Clamped      : {'YES (target beyond arm reach)' if clamped else 'NO'}")
-            
-            # If clamped AND residual > stage_limit, truly unreachable
+            print(f"  Clamped      : {'YES' if clamped else 'NO'}")
+
             if clamped and residual > self.cfg.stage_limit:
-                print(f"  [UNREACHABLE] Residual {residual*1000:.1f}mm > stage limit {self.cfg.stage_limit*1000:.0f}mm")
-                print(f"  Cannot reach target even with Stage compensation. Aborting.")
+                print(f"  [UNREACHABLE] Residual {residual*1000:.1f}mm > stage limit. Aborting.")
                 self.state = State.DONE
                 return
             elif clamped:
-                print(f"  [CLAMPED→OK] Residual {residual*1000:.1f}mm within stage range. Stage will compensate.")
-            
-            # Commit
+                print(f"  [CLAMPED→OK] Stage will compensate {residual*1000:.1f}mm.")
+
             self.q_cmd = required_q.copy()
-            
-            print(f"\n  [TRANSITION] MACRO_ARM → WAIT_MACRO")
+
+            print(f"  [TRANSITION] MACRO_ARM → WAIT_MACRO")
             self.state = State.WAIT_MACRO
             self._settle_timer = 0.0
             self._obs_buffer = []
-            
+
         except Exception as e:
             print(f"  [ERROR] Geometry planner failed: {e}")
             import traceback; traceback.print_exc()
@@ -486,21 +504,22 @@ class HybridController:
     def _step_wait_macro(self, actual_q: np.ndarray):
         """Phase 1.5: WAIT_MACRO — Wait for physical joints to reach target."""
         if actual_q is None: return
-        
-        err_rtz = abs(self.q_cmd[2] - actual_q[2])
-        err_lr  = abs(self.q_cmd[3] - actual_q[3])
-        
+
+        wi = self._wing_idx
+        err_rtz  = abs(self.q_cmd[2] - actual_q[2])
+        err_wing = abs(self.q_cmd[wi] - actual_q[wi])
+
         self._settle_timer += self.cfg.dt
-        
-        if err_rtz < self.cfg.joint_settle_rad and err_lr < self.cfg.joint_settle_rad:
+
+        if err_rtz < self.cfg.joint_settle_rad and err_wing < self.cfg.joint_settle_rad:
             print(f"  [MACRO SETTLED] Arm reached target in {self._settle_timer:.2f}s.")
             print(f"  [TRANSITION] WAIT_MACRO → MICRO_STAGE")
             self.state = State.MICRO_STAGE
-            self._obs_buffer = []  # Clear vision buffer
-            self.vision.reset()    # EMA filter clear
+            self._obs_buffer = []
+            self.vision.reset()
             self._settle_timer = 0.0
         elif self._settle_timer > self.cfg.settle_timeout:
-            print(f"  [TIMEOUT] Arm failed to settle. Error: rtZ={err_rtz:.3f}, Lr={err_lr:.3f}")
+            print(f"  [TIMEOUT] Arm settle fail. rtZ={err_rtz:.3f}, wing={err_wing:.3f}")
             self.state = State.DONE
 
     def _step_micro(self, raw_pin_err: np.ndarray):
@@ -628,8 +647,8 @@ class HybridController:
            하이브리드 충돌 회피형 VS 보정을 달성하게 될 것이다.
         6. 높이(Lz)가 요구치에 도달하면 self.state = State.DONE 판정.
         """
-        # 현재는 주석 골격 상태이므로 즉각 DONE 처리
-        print("\n[PHASE 3] VS_LIFT Stub reached. Pin-Hole fully aligned. Shutting down PBVS.")
+        # TODO: Z연속상승 + XY동시PBVS 구현
+        print(f"\n[PHASE 3] VS_LIFT Stub ({self.side}). Pin-Hole aligned. DONE.")
         self.state = State.DONE
     # ----- Utility -----
 
@@ -750,64 +769,83 @@ class HardwareInterface:
 # =============================================================================
 # Simulation & Test
 # =============================================================================
+def _run_side_sim(ctrl, hw, side, target_xy, max_iter=200, noise_std=0.0002):
+    """Run simulation for one side.
+
+    Simulates camera error: target_xy - current_pin position,
+    expressed in camera frame (inverse of mount rotation).
+    """
+    ctrl.set_target(target_xy, side=side, cartype=0)
+    scfg = SIDE_CFG[side]
+
+    print(f"\n--- {side.upper()} PIN ---")
+    print(f"  Target: {target_xy}, State: {ctrl.state.name}")
+
+    # cnt representation of q_cmd for c_pos simulation
+    def q_to_cpos(q):
+        q_hw = q.copy()
+        q_hw[2] = -q_hw[2]; q_hw[3] = -q_hw[3]; q_hw[4] = -q_hw[4]
+        return [q_hw[i] * ctrl.topik.m2cnt[i] for i in range(7)]
+
+    for i in range(max_iter):
+        # Simulate c_pos (actual motor position ≈ commanded)
+        sim_c_pos = q_to_cpos(ctrl.q_cmd)
+
+        # Simulate camera: world error → camera frame
+        true_pin = ctrl.kin.fk_pin(ctrl.q_cmd, side)
+        world_err_xy = target_xy - true_pin
+        noise = np.random.randn(2) * noise_std
+        world_err_xy += noise
+
+        # Inverse transform: world → camera frame (simplified for sim)
+        # cam_err_3d = R_mount^T @ R_world_pin^T @ [wx, wy, 0]
+        R_mount = scfg['cam_mount_R']
+        R_world = getattr(ctrl.topik, scfg['so3_attr'])
+        offset = scfg['cam_offset']
+        local_err = np.asarray(np.array(R_world).T @ np.array([world_err_xy[0], world_err_xy[1], 0.0])).flatten()
+        cam_err_3d = R_mount.T @ (local_err - offset)
+
+        q_cnt = ctrl.step(cam_raw=cam_err_3d, current_c_pos=np.array(sim_c_pos))
+        ctrl.q_cmd = hw.apply_safety_limits(ctrl.q_cmd)
+
+        if ctrl.is_done:
+            print(f"  [DONE] Converged in {i+1} iterations")
+            break
+
+        if (i + 1) % 10 == 0:
+            pin = ctrl.kin.fk_pin(ctrl.q_cmd, side)
+            err = np.linalg.norm(pin - target_xy)
+            print(f"  iter {i+1}: state={ctrl.state.name}, "
+                  f"pin={pin}, err={err:.6f}m")
+
+    final_pin = ctrl.kin.fk_pin(ctrl.q_cmd, side)
+    final_err = np.linalg.norm(final_pin - target_xy)
+    print(f"  Final {side} pin: {final_pin}, Error: {final_err:.6f} m")
+    return final_err
+
+
 def simulate_pbvs():
-    """Simulate the full Macro-Micro PBVS pipeline without real hardware."""
+    """Simulate the full Macro-Micro PBVS pipeline for both pins."""
     print("=" * 60)
-    print("Macro-Micro Hybrid PBVS Simulation")
+    print("Macro-Micro Hybrid PBVS Simulation (L → R)")
     print("=" * 60)
 
-    # Initialize
     cfg = ControlConfig(version=4)
     topik = ik.Topik(cfg.version)
     hw = HardwareInterface(topik, cfg)
     ctrl = HybridController(topik, cfg)
 
-    # Target: slightly offset from niro home position
-    target_xy = np.array([0.02, 0.70])  # X=2cm forward, Y=0.70m left
-    ctrl.set_target(target_xy, cartype=0)
+    # Left pin target
+    target_l = np.array([0.02, 0.70])
+    _run_side_sim(ctrl, hw, 'left', target_l)
 
-    print(f"\nTarget position: {target_xy}")
-    print(f"Initial state: {ctrl.state.name}")
-    print("-" * 60)
+    # Right pin target (mirrored X)
+    target_r = np.array([0.02, -0.70])
+    _run_side_sim(ctrl, hw, 'right', target_r)
 
-    max_iter = 200
-    vision_noise_std = 0.0002  # 0.2mm noise
-
-    for i in range(max_iter):
-        # Simulate vision feedback (true L-Pin position + noise)
-        true_lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
-        noise = np.random.randn(2) * vision_noise_std
-        simulated_vision = true_lpin + noise
-
-        # Step controller
-        q_cnt = ctrl.step(current_vision_xy=simulated_vision)
-
-        # Apply safety limits
-        ctrl.q_cmd = hw.apply_safety_limits(ctrl.q_cmd)
-
-        if ctrl.is_done:
-            print(f"\n[DONE] Converged in {i+1} iterations")
-            break
-
-        if (i + 1) % 10 == 0:
-            lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
-            err = np.linalg.norm(lpin - target_xy)
-            print(f"  iter {i+1}: state={ctrl.state.name}, "
-                  f"L-Pin={lpin}, err={err:.6f}m")
-
-    # Final results
     print("\n" + "=" * 60)
-    print("Final Results:")
-    final_lpin = ctrl.kin.fk_lpin(ctrl.q_cmd)
-    final_err = np.linalg.norm(final_lpin - target_xy)
-    q_cnt = hw.q_to_cnt(ctrl.q_cmd)
-
-    print(f"  State:    {ctrl.state.name}")
-    print(f"  Target:   {target_xy}")
-    print(f"  Achieved (L-Pin): {final_lpin}")
-    print(f"  Error:    {final_err:.6f} m")
     print(f"  q_cmd(m,rad): {np.round(ctrl.q_cmd, 6)}")
-    print(f"  q_cmd(cnt):   {q_cnt}")
+    print(f"  q_cmd(cnt):   {hw.q_to_cnt(ctrl.q_cmd)}")
     print("=" * 60)
 
 

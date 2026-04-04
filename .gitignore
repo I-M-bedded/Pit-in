@@ -168,3 +168,11 @@ cython_debug/
 .venvs/
 .Trash-1000/
 .tmp/
+
+*.urdf
+
+vision/dataset/
+
+runs/
+.claude
+result/
