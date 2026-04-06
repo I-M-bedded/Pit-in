@@ -1,14 +1,16 @@
 """
-TD-DRP v3+ 실제 학습 파이프라인
-================================
-LIS (Low-light Instance Segmentation) 데이터셋을 사용한
+TD-DRP v4 학습 파이프라인 (YOLO26n-pose backbone)
+===================================================
 Phase 1 (SSL Warm-up) + Phase 2 (Task Tuning) 학습.
+
+Backbone: YOLO26n-pose (P4, 128ch, stride=16)
+Seg classes: 4 (center_outer, center_inner, guide_outer, guide_inner)
 
 사용법:
   # Phase 1: SSL Warm-up (Encoder + Router + RSV-FiLM만 학습)
   python train.py --data_root ./data/LIS --phase 1 --epochs 50 --batch_size 4
 
-  # Phase 2: Task Tuning (YOLO 헤드까지 포함, Phase 1 체크포인트에서 이어서)
+  # Phase 2: Task Tuning (전체, Phase 1 체크포인트에서 이어서)
   python train.py --data_root ./data/LIS --phase 2 --epochs 30 --batch_size 4 --resume ./checkpoints/tddrp_phase1.pt
 
   # Phase 1 → Phase 2 연속 학습
@@ -29,9 +31,9 @@ import torch.nn.functional as F
 # 같은 디렉토리의 모듈 임포트
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from td_drp_v3plus import (
-    TDDRPv3Plus,
-    load_yolov8_seg_backbone,
+from td_drp_v4 import (
+    TDDRPv4,
+    load_yolo26_pose_backbone,
     IlluminationAugmentor,
 )
 from dataloader import get_dataloader, get_lis_class_names
@@ -42,7 +44,7 @@ from dataloader import get_dataloader, get_lis_class_names
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_optimizer(
-    model: TDDRPv3Plus,
+    model: TDDRPv4,
     phase: int,
     lr: Optional[float] = None,
 ) -> torch.optim.Optimizer:
@@ -83,7 +85,7 @@ def compute_seg_loss(
     seg_logits: torch.Tensor,
     masks_list: list,
     labels_list: list,
-    num_classes: int = 2,
+    num_classes: int = 4,
 ) -> torch.Tensor:
     """
     세그멘테이션 손실 계산 (Phase 2)
@@ -143,7 +145,7 @@ def compute_seg_loss(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_one_epoch(
-    model: TDDRPv3Plus,
+    model: TDDRPv4,
     dataloader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -239,7 +241,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model: TDDRPv3Plus,
+    model: TDDRPv4,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     phase: int,
@@ -297,7 +299,7 @@ def validate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(
-    model: TDDRPv3Plus,
+    model: TDDRPv4,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     phase: int,
@@ -317,7 +319,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: TDDRPv3Plus,
+    model: TDDRPv4,
     checkpoint_path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: torch.device = torch.device("cpu"),
@@ -342,7 +344,7 @@ def load_checkpoint(
 def train(args: argparse.Namespace) -> None:
     """메인 학습 루프"""
     print("=" * 60)
-    print("TD-DRP v3+ Training Pipeline")
+    print("TD-DRP v4 Training Pipeline (YOLO26n-pose)")
     print("=" * 60)
 
     device = torch.device(args.device)
@@ -350,13 +352,13 @@ def train(args: argparse.Namespace) -> None:
 
     # ── 모델 초기화
     print("\n── 모델 초기화 ──")
-    backbone = load_yolov8_seg_backbone(
+    backbone = load_yolo26_pose_backbone(
         model_name=args.model,
         feature_channels=args.feature_channels,
         extract_layer=args.extract_layer,
     )
 
-    model = TDDRPv3Plus(
+    model = TDDRPv4(
         feature_channels=args.feature_channels,
         illumination_channels=args.illumination_channels,
         num_experts=args.num_experts,
@@ -479,10 +481,9 @@ def train(args: argparse.Namespace) -> None:
     print("전체 학습 완료!")
     print("=" * 60)
     print(f"\n체크포인트 저장 위치: {args.checkpoint_dir}")
-    print("\nYOLO-seg 단독 모델과 비교하려면:")
-    print(f"  python yolo_seg_backbone.py --mode compare "
-          f"--data_root {args.data_root} "
-          f"--tddrp_ckpt {args.checkpoint_dir}/tddrp_phase2_best.pt")
+    print("\nYOLO26n-pose 단독 모델과 비교하려면:")
+    print(f"  python yolo_backbone.py --mode eval "
+          f"--data_root {args.data_root}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -532,9 +533,9 @@ def parse_args() -> argparse.Namespace:
                         help="데이터 로딩 워커 수")
 
     # 모델
-    parser.add_argument("--model", type=str, default="yolov8n-seg.pt",
-                        help="YOLOv8-seg 모델 이름")
-    parser.add_argument("--feature_channels", type=int, default=256)
+    parser.add_argument("--model", type=str, default="yolo26n-pose.pt",
+                        help="YOLO26n-pose 모델 이름")
+    parser.add_argument("--feature_channels", type=int, default=128)
     parser.add_argument("--illumination_channels", type=int, default=64)
     parser.add_argument("--num_experts", type=int, default=3)
     parser.add_argument("--extract_layer", type=int, default=6,

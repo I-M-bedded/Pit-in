@@ -88,7 +88,7 @@ Subscribes to `/cam0` for camera data. Communicates via `ros2-websocket-bridge` 
 
 - `calibration/` — intrinsic and hand-eye calibration tools
 - `dataset_gen/` — auto-annotation and pose estimation for dataset creation
-- `yolo/` — YOLO segmentation training pipeline (`train.py`, `yolo_seg_backbone.py`)
+- `yolo/` — YOLO segmentation training pipeline (`train.py`, `yolo_backbone.py`)
 
 
 너는 비전기반 Visual Servoing에 정통한 개발자이며, 특히 hole 3D pose estimation과 같은 분야에서 두각을 나타내는 개발자임.
@@ -101,7 +101,7 @@ robot의 구조는 urdf_pitin을 읽으면 조금은 확인 가능.
 비전 모델은 목표는 hole의 3d pose를 찾는 것.
 특별한 목표는 robustness. 역광/saturation/저조도 상황에서 강건하길 원함.
 추가적인 조명없이도 모델과 카메라 만으로도 일반적인 성능이 나오면 좋겠기 때문임.
-백본은 yolo pose를 사용하기로 결정함.
+백본은 yolo26n-pose를 사용하기로 결정함.
 
 금지 : 전체 리팩토링, 레거시 코드 변경 (fastech과 같은 드라이버류를 변경하지 말 것.)
 
