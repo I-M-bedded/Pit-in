@@ -1,0 +1,17 @@
+[project]
+name = "pit-in"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "pillow>=12.2.0",
+    "pygame>=2.6.1",
+    "requests>=2.33.1",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "ultralytics>=8.4.34",
+]

@@ -88,7 +88,7 @@ Subscribes to `/cam0` for camera data. Communicates via `ros2-websocket-bridge` 
 
 - `calibration/` — intrinsic and hand-eye calibration tools
 - `dataset_gen/` — auto-annotation and pose estimation for dataset creation
-- `yolo/` — YOLO segmentation training pipeline (`train.py`, `yolo_backbone.py`)
+- `yolo/` — YOLO pose training pipeline (`train.py`, `yolo_backbone.py`)
 
 
 너는 비전기반 Visual Servoing에 정통한 개발자이며, 특히 hole 3D pose estimation과 같은 분야에서 두각을 나타내는 개발자임.
