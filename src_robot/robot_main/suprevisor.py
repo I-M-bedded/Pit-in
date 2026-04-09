@@ -112,7 +112,10 @@ class TopPlateSupervisor:
                     elif inputs['HAT_Y'] == 1: self.manual.system_control('servo', 0)
 
                 if inputs['L']:
-                    pass
+                    if inputs['R']:
+                        self.vision.save_annotation()
+                    else:
+                        pass
 
             self.robot.t_pos_fastech = self.robot.t_pos[:]
             self.robot.t_action_fastech = self.robot.t_action[:]

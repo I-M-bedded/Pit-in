@@ -1,17 +1,26 @@
 [project]
 name = "pit-in"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "matplotlib>=3.10.8",
-    "numpy>=2.2.6",
+    "opencv-contrib-python>=4.13.0.92",
     "pandas>=2.3.3",
-    "pillow>=12.2.0",
-    "pygame>=2.6.1",
-    "requests>=2.33.1",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "ultralytics>=8.4.34",
+    "phasepack>=1.5",
+    "tabulate>=0.10.0",
+    "torch>=2.6.0",
+    "torchaudio>=2.6.0",
+    "torchvision>=0.21.0",
+    "tqdm>=4.67.3",
+    "ultralytics>=8.4.35",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }

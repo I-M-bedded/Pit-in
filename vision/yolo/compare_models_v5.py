@@ -30,7 +30,7 @@ TD_DRP_WEIGHTS = next(
     os.path.abspath(_CANDIDATES[0])
 )
 
-VAL_DIR = os.path.abspath("vision/dataset/yolo_pose_dataset/val")
+VAL_DIR = os.path.abspath("vision/dataset/yolo_pose_dataset/test")
 RESULT_DIR = os.path.abspath("result/compare_v5")
 # ==========================================
 

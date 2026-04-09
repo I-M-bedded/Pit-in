@@ -3,12 +3,24 @@ import sys
 import os
 import numpy as np
 import csv
+import cv2
 
+# Project root for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../../")
+
 try:
     from controller import ik
 except ImportError:
     pass
+
+try:
+    import pyrealsense2 as rs
+    from vision.dataset_gen.auto_annotator import AutoAnnotator, write_yolo_pose_label, MARKER_CENTERS, MIN_MARKERS_REQUIRED
+    HAS_VISION_GEN = True
+except ImportError:
+    HAS_VISION_GEN = False
+    print("[WARNING] Vision dataset generation modules not found.")
 
 class BaseTask:
     def __init__(self, robot):
@@ -266,17 +278,121 @@ class VisionTask(BaseTask):
         self.repeat_time = 0
         self.target_mid_state = []
         self.pause_ratio = self.config.pause_ratio
+        self.annotator = None
+        self.save_dir = "./dataset_auto"
+        os.makedirs(self.save_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.save_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(self.save_dir, "labels"), exist_ok=True)
 
     def run(self):
         inputs = self.robot.input_manager.get_state()
-        if inputs['R'] and inputs['L']:
-            pass 
+        # L + R trigger is handled in supervisor now, calling save_annotation()
 
-        if inputs['L']:
+        if inputs['L'] and not inputs['R']:
             self.robot.topik.get_q(self.robot.c_pos)
             self.robot.topik.fk()
-            zloc = self.robot.topik.x[0][2]
             print("FK Check:", self.robot.topik.x[0][0], self.robot.topik.x[0][1], self.robot.agv.lcam_hole_pos)
+    
+    def save_annotation(self):
+        """L + R trigger: Capture current frame and save YOLO Pose annotation."""
+        if not HAS_VISION_GEN:
+            print("[ERROR] Vision dataset generation modules not available.")
+            return
+
+        print("[INFO] Attempting to save annotation...")
+        
+        # 1. RealSense Capture
+        pipeline = rs.pipeline()
+        rs_config = rs.config()
+        rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        
+        try:
+            profile = pipeline.start(rs_config)
+            
+            # Get Intrinsics
+            stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            intr = stream.get_intrinsics()
+            K = np.array([[intr.fx, 0, intr.ppx],
+                          [0, intr.fy, intr.ppy],
+                          [0, 0, 1]], dtype=np.float64)
+            D = np.array(intr.coeffs, dtype=np.float64)
+            
+            # Capture Frame
+            for _ in range(10): # Warm up
+                pipeline.wait_for_frames()
+            
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                print("[ERROR] Failed to capture color frame.")
+                return
+            
+            frame = np.asanyarray(color_frame.get_data())
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 2. ArUco Marker Detection
+            aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50) # Default type
+            params = cv2.aruco.DetectorParameters()
+            
+            if hasattr(cv2.aruco, "ArucoDetector"):
+                detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+                corners, ids, _ = detector.detectMarkers(gray)
+            else:
+                corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
+                
+            if ids is None or len(ids) < MIN_MARKERS_REQUIRED:
+                print(f"[ERROR] Not enough markers detected ({len(ids) if ids is not None else 0}/{MIN_MARKERS_REQUIRED})")
+                return
+            
+            image_points = []
+            object_points = []
+            for i, marker_id in enumerate(ids.flatten()):
+                mid = int(marker_id)
+                if mid in MARKER_CENTERS:
+                    c = corners[i][0]
+                    cx_m, cy_m = np.mean(c[:, 0]), np.mean(c[:, 1])
+                    image_points.append([cx_m, cy_m])
+                    object_points.append(MARKER_CENTERS[mid])
+            
+            if len(image_points) < MIN_MARKERS_REQUIRED:
+                print(f"[ERROR] Required markers not in view.")
+                return
+                
+            success, rvec, tvec = cv2.solvePnP(
+                np.array(object_points, dtype=np.float32),
+                np.array(image_points, dtype=np.float32),
+                K, D, flags=cv2.SOLVEPNP_SQPNP
+            )
+            
+            if not success:
+                print("[ERROR] PnP failed.")
+                return
+                
+            # 3. Compute and Save
+            if self.annotator is None:
+                self.annotator = AutoAnnotator(K, D, 640, 480)
+            else:
+                self.annotator.K = K
+                self.annotator.D = D
+                
+            annotations, imgpts_dict = self.annotator.compute(rvec, tvec)
+            
+            if not annotations:
+                print("[ERROR] No valid annotations generated.")
+                return
+                
+            stem = f"robot_{int(time.time())}"
+            img_path = os.path.join(self.save_dir, "images", f"{stem}.jpg")
+            label_path = os.path.join(self.save_dir, "labels", f"{stem}.txt")
+            
+            cv2.imwrite(img_path, frame)
+            write_yolo_pose_label(label_path, annotations)
+            print(f"[SUCCESS] Saved image and YOLO Pose label: {stem}")
+            
+        except Exception as e:
+            print(f"[ERROR] VisionTask.save_annotation: {e}")
+        finally:
+            pipeline.stop()
     
     def save_data(self):
     # 1. 로봇 상태 및 순운동학(FK) 업데이트
