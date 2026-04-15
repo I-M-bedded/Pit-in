@@ -18,7 +18,7 @@ class UnitAdjustedWingCalibration:
         df = df[df['m1_id'] != "N/A"].reset_index(drop=True)
 
         # 1. 로봇 포즈 (이미 cm 단위이므로 그대로 로드)
-        robot_pos = df[['robot_x', 'robot_y']].to_numpy()
+        robot_pos = df[['robot_x', 'robot_y']].to_numpy() * 100.0
         robot_pos_3d = np.hstack([robot_pos, np.zeros((len(robot_pos), 1))])
         
         # 2. 로봇 회전 (Radian 단위 그대로 사용)
