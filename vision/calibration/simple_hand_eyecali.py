@@ -17,7 +17,7 @@ class UnitAdjustedWingCalibration:
         # 유효 데이터 필터링
         df = df[df['m1_id'] != "N/A"].reset_index(drop=True)
 
-        # 1. 로봇 포즈 (이미 cm 단위이므로 그대로 로드)
+        # 1. 로봇 포즈 (cm 단위로 바꿔야됨)
         robot_pos = df[['robot_x', 'robot_y']].to_numpy() * 100.0
         robot_pos_3d = np.hstack([robot_pos, np.zeros((len(robot_pos), 1))])
         
