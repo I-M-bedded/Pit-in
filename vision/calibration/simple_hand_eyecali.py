@@ -44,7 +44,7 @@ class UnitAdjustedWingCalibration:
 
         # 
         for m_data, m_ids in [(m1_data, m1_ids), (m2_data, m2_ids)]:
-            valid_mask = (m_ids != "N/A")
+            valid_mask = ~pd.isna(m_ids)
             if not np.any(valid_mask): continue
             
             v_robot_pos = robot_pos[valid_mask]
@@ -59,7 +59,7 @@ class UnitAdjustedWingCalibration:
             rotated_cam = (target_R @ v_m_data.T).T
             
             # 2. EE Offset(날개-카메라 거리) 적용 후 로봇 좌표계로 변환
-            offset_added = self.offset_t + rotated_cam
+            offset_added = rotated_cam - self.offset_t
             term_transformed = np.einsum('nij,nj->ni', v_robot_rot, offset_added)
             
             # 3. 월드 좌표계 상의 XY 위치 추정 (Z 제외)
@@ -82,7 +82,7 @@ class UnitAdjustedWingCalibration:
             self._error_function, 
             initial_guess, 
             args=(robot_pos, robot_rot, m1_data, m1_ids, m2_data, m2_ids, swap_axes),
-            method='lm'
+            method='trf'
         )
 
         if result.success:
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     known_offset_cm = [5.7, 2.9, -21.51] 
     
     calibrator = UnitAdjustedWingCalibration(offset_vector=known_offset_cm)
-    csv_file = "Calibration_data_cleaned.csv"
+    csv_file = "Pit-in/vision/Calibration_data.csv"
 
     print("🚀 단위를 보정한 비교 최적화를 시작합니다...")
     err1, rot1, eul1 = calibrator.solve(csv_file, swap_axes=False)

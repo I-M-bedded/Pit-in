@@ -1,0 +1,45 @@
+{
+  "total_frames": 0,
+  "class_names": [
+    "center_hole_outer",
+    "center_hole_inner",
+    "guide_hole_outer",
+    "guide_hole_inner"
+  ],
+  "keypoints": 9,
+  "targets": {
+    "CENTER": {
+      "pos": [
+        0.11,
+        0.147,
+        0.055
+      ],
+      "shape": "slot",
+      "size_lv1": [
+        0.072,
+        0.04
+      ],
+      "size_lv2": 0.026
+    },
+    "GUIDE_L": {
+      "pos": [
+        0.03,
+        0.147,
+        0.055
+      ],
+      "shape": "circle",
+      "size_lv1": 0.04,
+      "size_lv2": 0.026
+    },
+    "GUIDE_R": {
+      "pos": [
+        0.19,
+        0.147,
+        0.055
+      ],
+      "shape": "circle",
+      "size_lv1": 0.04,
+      "size_lv2": 0.026
+    }
+  }
+}

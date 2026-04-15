@@ -542,7 +542,7 @@ class fastech:
         except: print(f"bad comm state for alarm check {self.id}")
         try: self.servo_reset()
         except: print(f"bad comm state for reset {self.id}")
-        # self.servo_on()
+        self.servo_on()
         
     
     def _state_get(self,desired_pos,desired_vel,estop,can_move,desired_action=0):

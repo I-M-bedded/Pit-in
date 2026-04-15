@@ -115,7 +115,7 @@ class TopPlateSupervisor:
                     if inputs['R']:
                         self.vision.save_annotation()
                     else:
-                        pass
+                        self.vision.save_data()
 
             self.robot.t_pos_fastech = self.robot.t_pos[:]
             self.robot.t_action_fastech = self.robot.t_action[:]

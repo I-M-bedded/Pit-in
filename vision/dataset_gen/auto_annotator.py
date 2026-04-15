@@ -246,7 +246,7 @@ def draw_hud(frame: np.ndarray, detected_count: int, saved_count: int, auto_mode
 def run(args):
     dirs = setup_dataset_dirs(args["save_dir"])
     aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT[args["type"]])
-    params     = cv2.aruco.DetectorParameters()
+    params     = cv2.aruco.DetectorParameters_create()
     pipeline = rs.pipeline()
     config   = rs.config()
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
