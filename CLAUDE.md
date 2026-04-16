@@ -1,4 +1,4 @@
-# CLAUDE.md
+﻿# CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Control software for **Pit-in**, a battery-swapping AGV testbed. A 7-axis servo robot picks up and inserts battery pins into EVs. A vision system estimates hole 3D pose for visual servoing.
 
 - **Full operation**: Ubuntu 22.04 LTS + ROS2 Humble, Python 3.10.12
-- **Partial operation** (no ROS2, no evdev): Windows — auto-detects OS and skips unavailable modules
+- **Partial operation** (no ROS2, no evdev): Windows ??auto-detects OS and skips unavailable modules
 
 ## Commands
 
@@ -15,10 +15,14 @@ Control software for **Pit-in**, a battery-swapping AGV testbed. A 7-axis servo 
 # Run robot (from repo root)
 python src_robot/robot_main/main.py
 
-# Train vision model (TD-DRP on YOLO26n-pose backbone)
-python vision/yolo/train.py --data_root ./data/LIS --phase 1 --epochs 50 --batch_size 4   # Phase 1: SSL warm-up
-python vision/yolo/train.py --data_root ./data/LIS --phase 2 --epochs 30 --resume ./checkpoints/tddrp_phase1.pt  # Phase 2: Task tuning
-python vision/yolo/train.py --data_root ./data/LIS --phase 12 --epochs_p1 50 --epochs_p2 30  # Both phases
+# Train vision models (temp -> vision/yolo/runs/, results -> vision/result/)
+python vision/yolo/train_yolo_baseline.py --epochs 100                         # YOLO baseline
+python vision/yolo/train_clahe_baseline.py --epochs 100                        # CLAHE + YOLO baseline
+python vision/yolo/train_retinex_baseline.py --epochs 100                      # MSRCR + YOLO baseline
+python vision/yolo/train_coin_pose.py --phase 1 --epochs-p1 50 --batch-p1 4   # COIN Phase 1: SSL warm-up (50ep)
+python vision/yolo/train_coin_pose.py --phase 2 --p1-ckpt vision/yolo/runs/coin/phase1/best.pt --epochs-p2 80 --warmup-p2 5  # Phase 2
+python vision/yolo/train_coin_pose.py --phase 12 --epochs-p1 50 --epochs-p2 80  # Both phases
+python vision/yolo/compare_all.py  # Evaluate all 4 models + real inference
 
 # Backbone evaluation
 python vision/yolo/yolo_backbone.py --mode eval --data_root ./data/LIS
@@ -98,19 +102,19 @@ Subscribes to `/cam0` for camera data. Uses `ros2-websocket-bridge` for non-ROS2
 
 - `calibration/` -- intrinsic (`intrinsic_camera_calibration.py`) and hand-eye calibration (`simple_hand_eyecali.py`)
 - `dataset_gen/` -- auto-annotation (`auto_annotator.py`) and pose estimation (`pose_estimation_Board.py`)
-- `yolo/` -- TD-DRP vision model built on YOLO26n-pose backbone
+- `yolo/` -- COIN-Pose vision model built on YOLO26n-pose backbone
 
-#### TD-DRP Model (`vision/yolo/td_drp.py`)
+#### COIN-Pose Model (`vision/yolo/coin_pose.py`)
 
-Task-Driven Dynamic Routing with Feature-Consistency SSL. Designed for illumination robustness (backlight/saturation/low-light) without auxiliary lighting.
+Context-aware Occlusion and Illumination Network for pose estimation. It combines illumination-aware modulation, cross-scale context sharing, and occlusion reconstruction for robust hole pose estimation.
 
 Key components: `SpatiallyVariantIlluminationEncoder` (extracts illumination embedding Z from RGB), `SpatiallyAwareSoftRouter` (expert routing weights from Z), `RSVFiLM` (feature-wise linear modulation). Multi-scale features from YOLO26n-pose: P3(layer4, 128ch, stride8), P4(layer6, 128ch, stride16), P5(layer10, 256ch, stride32).
 
-Training: Phase 1 = SSL warm-up (encoder + router + RSV-FiLM only, YOLO frozen), Phase 2 = full task tuning (all params including YOLO backbone).
+Training: Phase 1 = SSL warm-up (COIN modules with YOLO frozen), Phase 2 = task tuning (all params including YOLO backbone).
 
 #### Backbone Extraction (`vision/yolo/yolo_backbone.py`)
 
-Extracts intermediate features from YOLO26n-pose for TD-DRP pipeline. Layer map in `YOLO26N_LAYER_INFO`.
+Extracts intermediate features from YOLO26n-pose for COIN-Pose pipeline. Layer map in `YOLO26N_LAYER_INFO`.
 
 ## Coordinate Convention
 
@@ -133,3 +137,4 @@ X-axis = line connecting L pin to R pin (L-to-R is +X). Right-handed coordinate 
 - Training code rewrite
 
 When you talk to me, just shortly.
+
