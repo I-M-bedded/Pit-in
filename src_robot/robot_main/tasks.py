@@ -441,41 +441,34 @@ class VisionTask(BaseTask):
 
         print(f"[SUCCESS] Calibration data saved. Detected Markers: {sorted_ids}")
 
-class PbvsTask(BaseTask):
-    """Macro-Micro PBVS Task — L pin first, then R pin sequentially."""
+class _PbvsBase(BaseTask):
+    """Single-side Macro-Micro PBVS task base."""
+    SIDE: str = ''
+
     def __init__(self, robot):
         super().__init__(robot)
         self.ctrl = robot.pbvs_ctrl
-        self.sides = ['left', 'right']
-        self.current_side_idx = 0
 
     def start(self):
         if not self.is_active:
             self.is_active = True
-            self.current_side_idx = 0
-            self._start_side('left')
+            cam_err = self._get_cam_data(self.SIDE)
+            self.ctrl.vision.set_side(self.SIDE)
+            bot_err = self.ctrl.vision.get_pin_error(cam_err)
 
-    def _start_side(self, side):
-        """Initialize HybridController for the given side."""
-        cam_err = self._get_cam_data(side)
-        self.ctrl.vision.set_side(side)
-        bot_err = self.ctrl.vision.get_pin_error(cam_err)
+            current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
+            current_q[2] = -current_q[2]
+            current_q[3] = -current_q[3]
+            current_q[4] = -current_q[4]
 
-        current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
-        current_q[2] = -current_q[2]
-        current_q[3] = -current_q[3]
-        current_q[4] = -current_q[4]
+            current_pin = self.ctrl.kin.fk_pin(current_q, self.SIDE)
+            target_xy = current_pin + bot_err[:2]
 
-        current_pin = self.ctrl.kin.fk_pin(current_q, side)
-        target_xy = current_pin + bot_err[:2]
-
-        self.ctrl.set_target(target_xy, side=side, cartype=self.robot.agv.cartype)
-
-        self.robot.t_action = [0]*7
-        print(f"PBVS Task Started — {side} pin (Target: {target_xy})")
+            self.ctrl.set_target(target_xy, side=self.SIDE, cartype=self.robot.agv.cartype)
+            self.robot.t_action = [0] * 7
+            print(f"PBVS Task Started — {self.SIDE} pin (Target: {target_xy})")
 
     def _get_cam_data(self, side):
-        """Get camera hole position for the given side."""
         if side == 'left':
             return np.array(self.robot.agv.lcam_hole_pos, dtype=float)
         else:
@@ -484,8 +477,7 @@ class PbvsTask(BaseTask):
     def run(self):
         if not self.is_active: return
 
-        side = self.sides[self.current_side_idx]
-        cam_raw = self._get_cam_data(side)
+        cam_raw = self._get_cam_data(self.SIDE)
         c_pos = np.array(self.robot.c_pos, dtype=float)
 
         q_cnt = self.ctrl.step(cam_raw=cam_raw, current_c_pos=c_pos)
@@ -496,12 +488,16 @@ class PbvsTask(BaseTask):
             self.robot.t_pos[i] = q_cnt[i]
 
         if self.ctrl.is_done:
-            print(f"PBVS {side} pin Finished.")
-            if self.current_side_idx == 0:
-                # Left done → start Right
-                self.current_side_idx = 1
-                self._start_side('right')
-            else:
-                # Right done → fully complete
-                self.robot.agv.op_state[0] = 255
-                self.reset()
+            print(f"PBVS {self.SIDE} pin Finished.")
+            self.robot.agv.op_state[0] = 255
+            self.reset()
+
+
+class PbvsLTask(_PbvsBase):
+    """PBVS for Left pin — triggered by LT+Y."""
+    SIDE = 'left'
+
+
+class PbvsRTask(_PbvsBase):
+    """PBVS for Right pin — triggered by RT+Y."""
+    SIDE = 'right'

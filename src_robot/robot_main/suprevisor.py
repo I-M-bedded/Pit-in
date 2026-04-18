@@ -15,7 +15,8 @@ class TopPlateSupervisor:
         self.loading = LoadingTask(robot)
         self.manual = ManualpinTask(robot)
         self.vision = VisionTask(robot)
-        self.pbvs = PbvsTask(robot)
+        self.pbvs_l = PbvsLTask(robot)
+        self.pbvs_r = PbvsRTask(robot)
 
     def run_loop(self):
         print("*** Top plate Supervisor Start ***")
@@ -26,10 +27,12 @@ class TopPlateSupervisor:
             self.homing.run()
             self.loading.run()
             self.vision.run()
-            self.pbvs.run()
-            
+            self.pbvs_l.run()
+            self.pbvs_r.run()
+
             if self.robot.agv.task_clear_top:
-                self.homing.reset(); self.loading.reset(); self.pbvs.reset()
+                self.homing.reset(); self.loading.reset()
+                self.pbvs_l.reset(); self.pbvs_r.reset()
             
             # --- Trigger Logic ---
             
@@ -46,12 +49,15 @@ class TopPlateSupervisor:
                     self.loading.start_approach()
                 elif (reqid == 0x131 and preset == 5) or (inputs['LT_PRESSED'] and inputs['X']):
                     self.loading.start_load()
-            # [Vision Pin Control via PBVS]
-            if inputs['LT_PRESSED'] and inputs['Y']:
-                self.pbvs.start()
+            # [PBVS — L pin: LT+Y, R pin: RT+Y]
+            if inputs['LT_PRESSED'] and inputs['Y'] and not self.pbvs_r.is_active:
+                self.pbvs_l.start()
+            if inputs['RT_PRESSED'] and inputs['Y'] and not self.pbvs_l.is_active:
+                self.pbvs_r.start()
 
             # [Manual Control] - 자동 작업 아닐 때만
-            if not self.homing.is_active and not self.loading.is_active and not self.pbvs.is_active:
+            if not self.homing.is_active and not self.loading.is_active \
+               and not self.pbvs_l.is_active and not self.pbvs_r.is_active:
                 
                 # 1. Pin Manual (START/SEL)
                 if inputs['START'] or inputs['SEL']:

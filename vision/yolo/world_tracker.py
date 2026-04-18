@@ -96,13 +96,9 @@ class WorldTracker:
         # Transform to world
         world_pos = cam_origin_world + (cam_to_world @ tvec_cam)
 
-        # Resolve line-fitting symmetric ambiguity in world space
-        if result.source == "line" and self._world_pos is not None:
-            # Mirror the estimate through the centroid of detected holes
-            # (the line midpoint maps to world too — flip if further from EMA)
-            mirror = 2.0 * cam_origin_world - world_pos  # rough mirror
-            if np.linalg.norm(mirror - self._world_pos) < np.linalg.norm(world_pos - self._world_pos):
-                world_pos = mirror
+        # NOTE: "line" source (Tier 2b) never reaches here because its pose is None
+        # → handled by _decay_and_return above. Symmetry ambiguity for "line" would
+        # require a 3D candidate, which is unavailable without depth. Future work.
 
         # EMA update (alpha scaled by confidence)
         alpha = self.ema_alpha * result.confidence

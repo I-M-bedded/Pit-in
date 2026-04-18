@@ -306,11 +306,13 @@ class HolePoseEstimator:
         weights_path: str,
         camera_matrix: np.ndarray,
         dist_coeffs: np.ndarray,
-        device: str = "0",
+        device: str = "cuda:0",
         conf_threshold: float = 0.5,
         kp_conf: float = 0.15,
         reliability_threshold: float = 0.6,
         sigma: float = 20.0,
+        half: bool = False,
+        imgsz: int = 640,
     ):
         self.model = YOLO(weights_path)
         self.K = camera_matrix
@@ -320,16 +322,38 @@ class HolePoseEstimator:
         self.kp_conf = kp_conf
         self.reliability_threshold = reliability_threshold
         self.sigma = sigma
+        self.half = half
+        self.imgsz = imgsz
+
+        # Warm-up: compile CUDA kernels and TensorRT context before live frames
+        _dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
+        for _ in range(3):
+            self.model.predict(
+                source=_dummy, conf=conf_threshold,
+                device=device, half=half, imgsz=imgsz, verbose=False,
+            )
 
     # ------------------------------------------------------------------
     #  Public API
     # ------------------------------------------------------------------
 
-    def estimate(self, img_bgr: np.ndarray) -> CenterHoleResult:
-        """Estimate center-hole position from a single BGR frame (stateless)."""
+    def estimate(
+        self,
+        img_bgr: np.ndarray,
+        prior_xy: Optional[np.ndarray] = None,
+    ) -> CenterHoleResult:
+        """Estimate center-hole position from a single BGR frame (stateless).
+
+        Args:
+            img_bgr:  BGR image from RealSense color stream.
+            prior_xy: Previous center-hole pixel position (u, v) projected from
+                      WorldTracker world estimate.  Used by Tier-2b to resolve
+                      the line-direction ambiguity caused by the symmetric hole
+                      layout.  Pass None when no prior is available.
+        """
         results = self.model.predict(
             source=img_bgr, conf=self.conf_threshold,
-            device=self.device, verbose=False,
+            device=self.device, half=self.half, imgsz=self.imgsz, verbose=False,
         )
         r = results[0]
 
@@ -345,7 +369,7 @@ class HolePoseEstimator:
             return t1
 
         # --- Tier 2 ---
-        t2 = self._tier2_line_fitting(detections)
+        t2 = self._tier2_line_fitting(detections, prior_xy)
         t2.detections = detections
         return t2
 
@@ -420,36 +444,78 @@ class HolePoseEstimator:
     #  Tier 2 — line fitting from all detections
     # ------------------------------------------------------------------
 
-    def _tier2_line_fitting(self, dets: List[dict]) -> CenterHoleResult:
-        # 2a: CenterHole_B (outer) alone — AR-verified, so trustworthy
+    def _tier2_line_fitting(
+        self,
+        dets: List[dict],
+        prior_xy: Optional[np.ndarray] = None,
+    ) -> CenterHoleResult:
+        # ------------------------------------------------------------------
+        # Case 2a: CenterHole_B (outer) present and AR-verified → conic recovery
+        # ------------------------------------------------------------------
         outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
         if outer is not None and outer["ellipse"] is not None:
-            center = outer["ellipse"]["center_xy"].copy()
+            corrected = conic_center_recovery(outer["ellipse"], self.K)
+            if corrected is not None:
+                center, _ = corrected
+                source = "conic"
+            else:
+                center = outer["ellipse"]["center_xy"].copy()
+                source = "ellipse"
             pose = self._solve_for(outer, center)
             return CenterHoleResult(center_xy=center, confidence=outer["conf"] * 0.7,
-                                    source="ellipse", pose=pose)
+                                    source=source, pose=pose)
 
-        # 2b: CenterHole (inner) alone can't be distinguished from guide_hole_inner
-        #     → fall through to line fitting with all detections
-
-        # Collect all ellipse centers → fit line
+        # ------------------------------------------------------------------
+        # Case 2b: no reliable single detection → line fitting on all keypoints
+        #
+        # Each detection contributes up to 2 points to the cloud:
+        #   · boundary kp1-kp8 → ellipse fitting → ellipse center
+        #   · center kp0       → used directly
+        #
+        # Symmetric hole layout causes direction ambiguity on the fitted line.
+        # prior_xy (previous center-hole pixel, from WorldTracker back-projection)
+        # is used to resolve which end of the line is the correct center direction.
+        # Exact hole-position offsets along the line are TODO (user to define).
+        # ------------------------------------------------------------------
         pts = []
+        valid_dets_for_conf = []
         for d in dets:
+            added = False
             if d["ellipse"] is not None:
                 pts.append(d["ellipse"]["center_xy"])
+                added = True
+            if d["kp0_conf"] >= self.kp_conf:
+                pts.append(d["kp0_xy"])
+                added = True
+            if added:
+                valid_dets_for_conf.append(d)
+
         if len(pts) < 2:
             return CenterHoleResult()
 
-        pts = np.array(pts)
+        pts = np.array(pts, dtype=np.float64)
         mean = pts.mean(axis=0)
         _, _, Vt = np.linalg.svd(pts - mean)
         direction = Vt[0]
         projs = (pts - mean) @ direction
+
+        # Midpoint of projected range as initial center estimate
         mid = (projs.max() + projs.min()) / 2.0
         estimated = mean + mid * direction
 
-        avg_conf = np.mean([d["conf"] for d in dets if d["ellipse"] is not None])
-        return CenterHoleResult(center_xy=estimated, confidence=float(avg_conf * 0.4),
+        # Direction disambiguation using world prior
+        # The symmetric layout produces a mirror candidate:
+        #   candidate A = mean + mid * direction
+        #   candidate B = mean - mid * direction (reflection through mean)
+        # Pick the one closer to prior_xy.
+        if prior_xy is not None:
+            candidate_b = mean - mid * direction
+            if (np.linalg.norm(candidate_b - prior_xy) <
+                    np.linalg.norm(estimated - prior_xy)):
+                estimated = candidate_b
+
+        avg_conf = float(np.mean([d["conf"] for d in valid_dets_for_conf]))
+        return CenterHoleResult(center_xy=estimated, confidence=avg_conf * 0.4,
                                 source="line")
 
     # ------------------------------------------------------------------
