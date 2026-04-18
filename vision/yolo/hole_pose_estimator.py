@@ -518,7 +518,7 @@ class HolePoseEstimator:
         # A low-confidence CenterHole that wasn't good enough for conic in
         # Case 2a is still a strong geometric anchor — letting it contribute
         # to the line fit / template match means e.g. a 3-point cloud with
-        # gaps (8 cm, 14 cm) correctly identifies its leftmost point as
+        # gaps (8 cm, 14 cm) correctly identifies"""  """ its leftmost point as
         # the center (subset {0, +0.08, +0.22}).
         #
         # Per-detection solvePnP gives a metric tvec in camera frame.  We fit
