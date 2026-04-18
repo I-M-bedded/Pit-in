@@ -28,11 +28,15 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+# -- Ensure vision/yolo is on sys.path before local imports --
 REPO_ROOT = Path(__file__).resolve().parent.parent
-VISION_YOLO = REPO_ROOT / "vision" / "yolo"
-for p in [str(VISION_YOLO)]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+_yolo_dir = str(REPO_ROOT / "vision" / "yolo")
+if _yolo_dir not in sys.path:
+    sys.path.insert(0, _yolo_dir)
+# Also add vision/ itself so sibling modules are reachable
+_vision_dir = str(REPO_ROOT / "vision")
+if _vision_dir not in sys.path:
+    sys.path.insert(0, _vision_dir)
 
 import rclpy
 from rclpy.node import Node

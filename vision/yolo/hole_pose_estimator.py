@@ -41,7 +41,8 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from train_clahe_baseline import CLAHE_CLIP, CLAHE_GRID, apply_clahe
-from train_coin_pose import patch_yolo_with_coin
+# Lazy import — coin_pose may not exist outside training environments
+# from train_coin_pose import patch_yolo_with_coin
 from train_retinex_baseline import (
     COLOR_RESTORE_ALPHA,
     COLOR_RESTORE_BETA,
@@ -630,6 +631,7 @@ def draw_detection(image: np.ndarray, detection: dict) -> np.ndarray:
 def load_model(yolo_weights: Path, device: str, coin_weights: Optional[Path]) -> YOLO:
     model = YOLO(str(yolo_weights))
     if coin_weights is not None:
+        from train_coin_pose import patch_yolo_with_coin
         patch_yolo_with_coin(model, coin_ckpt=str(coin_weights), anchor_weight=0.0, aux_tv_weight=0.0)
     return model
 
