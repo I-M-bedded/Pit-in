@@ -164,6 +164,12 @@ class VisionFeedback:
         hole_world = np.asarray(world_hole_xyz, dtype=float).flatten()
         return hole_world[:2] - pin_world[:2]
 
+    def get_target_error(self, target_xy: np.ndarray) -> np.ndarray:
+        """Compute world-frame pin-to-target error for a frozen world target."""
+        pin_world = np.asarray(self.topik.x[self._fk_idx], dtype=float).flatten()
+        target_world = np.asarray(target_xy[:2], dtype=float).flatten()
+        return target_world - pin_world[:2]
+
     def update_error(self, raw_pin_err: np.ndarray) -> np.ndarray:
         """Apply EMA filter to the world pin error."""
         if not self._initialized:
@@ -295,9 +301,13 @@ class HybridController:
 
         # Current joint command in (m, rad)
         self.q_cmd = np.zeros(7)
+        self.q_cmd_cnt = [0] * 7
 
-        # Target position [x, y] in robot frame (meter)
-        self.target_xy = np.zeros(2)
+        # Phase targets [x, y] in robot/world frame (meter).
+        # Macro uses the task-start snapshot. Micro latches a fresh snapshot
+        # once, right after the arm settles, and keeps following only that.
+        self.macro_target_xy = np.zeros(2)
+        self.micro_target_xy: Optional[np.ndarray] = None
 
         # Weight diagonal: [stageX, stageY, rtZ, wing]
         self.W_diag = np.array([cfg.w_stage, cfg.w_stage,
@@ -319,7 +329,8 @@ class HybridController:
             side: 'left' or 'right'
             cartype: vehicle type index
         """
-        self.target_xy = np.asarray(target_xy[:2], dtype=float)
+        self.macro_target_xy = np.asarray(target_xy[:2], dtype=float)
+        self.micro_target_xy = None
         self.side = side
         self.topik.cartype = cartype
         self.vision.set_side(side)
@@ -334,8 +345,9 @@ class HybridController:
 
         Args:
             world_raw: [x, y, z] hole position in world frame (from /cam0, m).
-                       Vision node already resolves camera→world and EMA-filters,
-                       so we only need pin-to-hole subtraction here.
+                       Macro uses the task-start snapshot. Micro latches a new
+                       world target once at phase entry and then keeps following
+                       that frozen target, instead of the live hole stream.
             current_c_pos: [7] actual motor positions in encoder counts, or None
 
         Returns:
@@ -346,16 +358,27 @@ class HybridController:
         #   JointState counts -> Topik.get_q() -> Topik.fk()
         # This avoids subtle drift between manual cnt2m/sign handling here
         # and the FK basis used to publish /cam0 world coordinates.
+        actual_cnt = None
         if current_c_pos is not None:
             q_cnt = np.asarray(current_c_pos, dtype=int)
+            actual_cnt = q_cnt.copy()
             self.topik.get_q(q_cnt)
             self.topik.fk()
             actual_q = self.topik.qm.copy()
 
         # --- World-frame hole → pin-to-hole error ---
         world_pin_err = None
-        if world_raw is not None:
-            world_pin_err = self.vision.get_pin_error(np.asarray(world_raw))
+        if self.state == State.MICRO_STAGE and world_raw is not None:
+            if self.micro_target_xy is None:
+                self.micro_target_xy = np.asarray(world_raw[:2], dtype=float)
+                print(f"  [LATCH] MICRO target fixed at ({self.micro_target_xy[0]:.4f}, "
+                      f"{self.micro_target_xy[1]:.4f}) m")
+            world_pin_err = self.vision.get_target_error(self.micro_target_xy)
+        elif self.state == State.VS_LIFT:
+            if self.micro_target_xy is not None:
+                world_pin_err = self.vision.get_target_error(self.micro_target_xy)
+            elif world_raw is not None:
+                world_pin_err = self.vision.get_pin_error(np.asarray(world_raw))
         
         # --- State Machine ---
         if self.state == State.MACRO_ARM:
@@ -366,7 +389,7 @@ class HybridController:
                 self.state = State.MICRO_STAGE
         elif self.state == State.WAIT_MACRO:
             if current_c_pos is not None:
-                self._step_wait_macro(actual_q)
+                self._step_wait_macro(actual_q, actual_cnt)
         elif self.state == State.MICRO_STAGE:
             if self.cfg.enable_micro:
                 if world_pin_err is not None:
@@ -383,7 +406,8 @@ class HybridController:
         elif self.state == State.DONE:
             pass  # Hold position
 
-        return self._q_cmd_to_cnt()
+        self.q_cmd_cnt = self._q_cmd_to_cnt()
+        return self.q_cmd_cnt
 
     # ----- Geometry Planner (Analytical 2-Link IK) -----
 
@@ -456,7 +480,7 @@ class HybridController:
 
     def _step_macro(self):
         """Phase 1: MACRO_ARM — Analytical Geometry Planner (2-Link IK)"""
-        target = self.target_xy.copy()
+        target = self.macro_target_xy.copy()
         wi = self._wing_idx  # 3 (Lr) or 4 (Rr)
 
         print("\n" + "="*60)
@@ -507,31 +531,42 @@ class HybridController:
             import traceback; traceback.print_exc()
             self.state = State.DONE
 
-    def _step_wait_macro(self, actual_q: np.ndarray):
+    def _step_wait_macro(self, actual_q: np.ndarray, actual_cnt: np.ndarray):
         """Phase 1.5: WAIT_MACRO — Wait for physical joints to reach target."""
-        if actual_q is None: return
+        if actual_q is None or actual_cnt is None:
+            return
 
         wi = self._wing_idx
-        err_rtz  = abs(self.q_cmd[2] - actual_q[2])
-        err_wing = abs(self.q_cmd[wi] - actual_q[wi])
+        rtz_tol_cnt = max(1, int(np.ceil(self.cfg.joint_settle_rad * self.topik.m2cnt[2])))
+        wing_tol_cnt = max(1, int(np.ceil(self.cfg.joint_settle_rad * self.topik.m2cnt[wi])))
+
+        err_rtz_cnt = abs(int(self.q_cmd_cnt[2]) - int(actual_cnt[2]))
+        err_wing_cnt = abs(int(self.q_cmd_cnt[wi]) - int(actual_cnt[wi]))
 
         self._settle_timer += self.cfg.dt
 
-        if err_rtz < self.cfg.joint_settle_rad and err_wing < self.cfg.joint_settle_rad:
+        if err_rtz_cnt <= rtz_tol_cnt and err_wing_cnt <= wing_tol_cnt:
             print(f"  [MACRO SETTLED] Arm reached target in {self._settle_timer:.2f}s.")
             print(f"  [TRANSITION] WAIT_MACRO → MICRO_STAGE")
             self.state = State.MICRO_STAGE
+            self.micro_target_xy = None
             self._obs_buffer = []
             self.vision.reset()
             self._settle_timer = 0.0
         elif self._settle_timer > self.cfg.settle_timeout:
-            print(f"  [TIMEOUT] Arm settle fail. rtZ={err_rtz:.3f}, wing={err_wing:.3f}")
+            err_rtz = abs(self.q_cmd[2] - actual_q[2])
+            err_wing = abs(self.q_cmd[wi] - actual_q[wi])
+            print(f"  [TIMEOUT] Arm settle fail. "
+                  f"rtZ={err_rtz:.3f}rad ({err_rtz_cnt} cnt), "
+                  f"wing={err_wing:.3f}rad ({err_wing_cnt} cnt)")
+            print(f"           target_cnt rtZ/wing=({self.q_cmd_cnt[2]}, {self.q_cmd_cnt[wi]}), "
+                  f"actual_cnt=({int(actual_cnt[2])}, {int(actual_cnt[wi])})")
             self.state = State.DONE
 
     def _step_micro(self, raw_pin_err: np.ndarray):
-        """Phase 2: MICRO_STAGE — Discrete Observation (Look) and Offset Computation."""
+        """Phase 2: MICRO_STAGE — frozen-target observation and stage correction."""
         
-        # 1. Gather raw errors
+        # 1. Gather pin-to-frozen-target errors
         self._obs_buffer.append(raw_pin_err)
         
         # Keep observing until we reach the required number of frames
@@ -584,19 +619,19 @@ class HybridController:
         # 이동 속도/거리 제한
         step_x = err_x * self.cfg.pbvs_lambda
         step_y = err_y * self.cfg.pbvs_lambda
-        
 
+        # Small residuals still need a decisive move, but preserve the sign.
+        if abs(step_x) < 0.005:
+            step_x = err_x * 0.95
+        if abs(step_y) < 0.005:
+            step_y = err_y * 0.95
 
         disp = np.hypot(step_x, step_y)
         max_disp = self.cfg.max_stage_vel * self.cfg.dt * self.cfg.micro_obs_frames
         if disp > max_disp:
-            step_x *= max_disp / disp
-            step_y *= max_disp / disp
-        
-        if step_x < 0.005 :
-            step_x = err_x * 0.95
-        if step_y < 0.005 :
-            step_y = err_y * 0.95
+            scale = max_disp / disp
+            step_x *= scale
+            step_y *= scale
         
         print(f"  [MICRO OBS] Target Error: dX={err_x*1000:.1f}mm, dY={err_y*1000:.1f}mm")
         
