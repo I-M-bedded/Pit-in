@@ -466,10 +466,11 @@ class HybridController:
         try:
             rtZ, wing, clamped = self._geometry_plan_arm(target, self.side)
 
-            # Build q_cmd: stages locked at current, other wing untouched
-            required_q = self.q_cmd.copy()
-            required_q[0] = 0.0  # stage X
-            required_q[1] = 0.0  # stage Y
+            # Build q_cmd from the latest measured FK state.
+            # FK Verify must use the same current stage offsets seen in
+            # check_fk / topik.x, otherwise the "verify" pose is evaluated
+            # at a different origin than the real robot.
+            required_q = self.topik.qm.copy()
             required_q[2] = rtZ
             required_q[wi] = wing
 
