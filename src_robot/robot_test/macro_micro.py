@@ -412,69 +412,82 @@ class HybridController:
     # ----- Geometry Planner (Analytical 2-Link IK) -----
 
     def _geometry_plan_arm(self, target_xy: np.ndarray, side: str = 'left') -> Tuple[float, float, bool]:
-        """Analytical 2-link planar arm IK (side-aware).
+        """Analytical 2-link planar arm IK with current stage offsets locked.
 
-        Left FK chain (stage=0):
-          Wing Center = Base + Rot(rtZ) @ [-d2[1], -d2[0]]
-          Left Pin    = Wing Center + [-d3[1]*cos(rtZ+Lr), -d3[1]*sin(rtZ+Lr)]
-
-        Right FK chain (stage=0):
-          Wing Center = Base + Rot(rtZ) @ [+d2[1], -d2[0]]
-          Right Pin   = Wing Center + [+d3[1]*cos(rtZ+Rr), +d3[1]*sin(rtZ+Rr)]
-
-        Returns:
-            (rtZ, wing_angle, clamped): rtZ and Lr/Rr in radians
+        ``target_xy`` is a world-frame point.  During macro planning the stage
+        axes stay at their current values, so we first remove the current stage
+        translation and solve only the 2-link arm geometry.  For each side we
+        generate the two elbow branches, then choose the branch that stays
+        closest to the current arm configuration while still satisfying limits.
         """
-        d2 = self.topik.d2  # [0.024, 0.5695]
-        d3_1 = self.topik.d3[1]  # 0.163
-        s = SIDE_CFG[side]['ik_sign']  # -1 for left, +1 for right
+        d2 = self.topik.d2
+        d3_1 = self.topik.d3[1]
+        wi = SIDE_CFG[side]['wing_joint']
 
-        L1 = np.sqrt(d2[0]**2 + d2[1]**2)
-        L2 = d3_1
+        # Lock current stage offsets and solve the arm-only target in that
+        # translated frame.  FK uses x=q0+..., y=-q1+..., so we invert that here.
+        tx = float(target_xy[0] - self.topik.qm[0] - self.topik.x0)
+        ty = float(target_xy[1] + self.topik.qm[1] - self.topik.y0)
 
-        # phi_offset: structural slant of d2 vector
-        #   Left:  arm extends -X → atan2(d2[0], -d2[1])
-        #   Right: arm extends +X → atan2(-d2[0], d2[1])
-        phi_offset = np.arctan2(-s * d2[0], s * d2[1])
+        if side == 'left':
+            link1_vec = np.array([-d2[1], d2[0]], dtype=float)
+            link2_heading_offset = np.pi
+        else:
+            link1_vec = np.array([d2[1], d2[0]], dtype=float)
+            link2_heading_offset = 0.0
 
-        tx, ty = target_xy[0], target_xy[1]
-        r = np.sqrt(tx**2 + ty**2)
+        L1 = float(np.linalg.norm(link1_vec))
+        L2 = float(d3_1)
+        phi1 = float(np.arctan2(link1_vec[1], link1_vec[0]))
 
         clamped = False
+        r = float(np.hypot(tx, ty))
         r_max = L1 + L2
         r_min = abs(L1 - L2)
-
         if r > r_max:
             clamped = True
-            r = r_max - 0.001
+            scale = (r_max - 1e-3) / max(r, 1e-9)
+            tx *= scale
+            ty *= scale
         elif r < r_min:
             clamped = True
-            r = r_min + 0.001
+            scale = (r_min + 1e-3) / max(r, 1e-9)
+            tx *= scale
+            ty *= scale
 
-        # Law of cosines: elbow angle
-        cos_alpha = (L1**2 + L2**2 - r**2) / (2 * L1 * L2)
-        cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
-        alpha = np.arccos(cos_alpha)
+        c2 = (tx * tx + ty * ty - L1 * L1 - L2 * L2) / (2.0 * L1 * L2)
+        c2 = float(np.clip(c2, -1.0, 1.0))
+        s2_abs = float(np.sqrt(max(0.0, 1.0 - c2 * c2)))
 
-        # Base angle
-        theta_target = np.arctan2(ty, tx)
-        cos_beta = (L1**2 + r**2 - L2**2) / (2 * L1 * r)
-        cos_beta = np.clip(cos_beta, -1.0, 1.0)
-        beta = np.arccos(cos_beta)
+        current_q2 = float(self.topik.qm[2])
+        current_wing = float(self.topik.qm[wi])
+        candidates = []
 
-        # Elbow configuration:
-        #   Left:  elbow-in → rtZ = theta - beta - phi
-        #   Right: elbow-in → rtZ = theta + beta - phi
-        rtZ = theta_target + s * beta - phi_offset
+        for s2 in (s2_abs, -s2_abs):
+            theta2 = float(np.arctan2(s2, c2))
+            theta1 = float(np.arctan2(ty, tx) - np.arctan2(L2 * s2, L1 + L2 * c2))
 
-        # Wing angle (relative to base rotation)
-        wing = phi_offset - s * alpha
+            rtZ = theta1 - phi1
+            wing = theta2 - link2_heading_offset + phi1
 
-        # Normalize to [-pi, pi]
-        rtZ = (rtZ + np.pi) % (2 * np.pi) - np.pi
-        wing = (wing + np.pi) % (2 * np.pi) - np.pi
+            rtZ = (rtZ + np.pi) % (2 * np.pi) - np.pi
+            wing = (wing + np.pi) % (2 * np.pi) - np.pi
 
-        return rtZ, wing, clamped
+            q_try = self.topik.qm.copy()
+            q_try[2] = rtZ
+            q_try[wi] = wing
+            q_limited = self.hw.apply_safety_limits(q_try)
+
+            clipped = (abs(q_limited[2] - rtZ) > 1e-9 or
+                       abs(q_limited[wi] - wing) > 1e-9)
+            pin_try = self.kin.fk_pin(q_limited, side)
+            residual = float(np.linalg.norm(np.asarray(target_xy[:2], dtype=float) - pin_try))
+            delta = abs(q_limited[2] - current_q2) + abs(q_limited[wi] - current_wing)
+
+            candidates.append((clipped, residual, delta, float(q_limited[2]), float(q_limited[wi])))
+
+        _, _, _, rtZ_best, wing_best = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+        return rtZ_best, wing_best, clamped
 
     # ----- State handlers -----
 
