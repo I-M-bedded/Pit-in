@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="3">
+
+  <!-- ① 패키지 이름 → 폴더명과 반드시 일치해야 함 -->
+  <name>my_robot_handeye</name>
+
+  <!-- ② 버전 → 아무 숫자나 써도 됨, 그냥 0.1.0 고정으로 써도 무방 -->
+  <version>0.1.0</version>
+
+  <!-- ③ 설명 → 아무 텍스트나 OK, 빌드에 영향 없음 -->
+  <description>Hand-eye calibration package</description>
+
+  <!-- ④ 관리자 → 이름/이메일 아무거나 써도 됨, 빌드에 영향 없음 -->
+  <maintainer email="bjy1224@inha.edu">my_name</maintainer>
+
+  <!-- ⑤ 라이선스 → 아무거나 써도 됨 -->
+  <license>Apache-2.0</license>
+
+  <!-- ⑥ 의존성 → 이게 핵심! 실제로 import하는 패키지들 명시 -->
+  <depend>rclpy</depend>
+  <depend>tf2_ros</depend>
+  <depend>geometry_msgs</depend>
+  <depend>ros2_aruco_interfaces</depend>
+
+  <!-- ⑦ 빌드 타입 → Python 패키지면 반드시 ament_python -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+
+</package>
