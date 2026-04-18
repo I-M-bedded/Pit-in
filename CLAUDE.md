@@ -102,7 +102,44 @@ Subscribes to `/cam0` for camera data. Uses `ros2-websocket-bridge` for non-ROS2
 
 - `calibration/` -- intrinsic (`intrinsic_camera_calibration.py`) and hand-eye calibration (`simple_hand_eyecali.py`)
 - `dataset_gen/` -- auto-annotation (`auto_annotator.py`) and pose estimation (`pose_estimation_Board.py`)
-- `yolo/` -- COIN-Pose vision model built on YOLO26n-pose backbone
+- `yolo/` -- COIN-Pose vision model + online pose pipeline
+- `vision_node.py` -- ROS2 node that runs `HolePoseEstimator` + `WorldTracker` and publishes **world-frame** hole position to `/cam0`, `/cam1` (`geometry_msgs/Point`). `--debug` flag enables per-detection overlay + class/conf log.
+
+#### Class Mapping (shared by estimator + auto-annotator)
+
+`Hole` (no suffix) = **inner** ring, `Hole_B` = **outer** ring.
+
+| ID | Name                | Notes |
+|----|---------------------|-------|
+| 0  | center_hole_inner   | CenterHole |
+| 1  | center_hole_outer   | CenterHole_B, AR gate > 1.3 |
+| 2  | guide_hole_inner    | Hole (experimental board has 4) |
+| 3  | guide_hole_outer    | Hole_B |
+
+#### Online Pose Pipeline (`vision/yolo/hole_pose_estimator.py`)
+
+Per-frame tiered estimator (`HolePoseEstimator.estimate()`):
+
+- **Case 1** -- center_hole_inner + center_hole_outer both present: solvePnP with full keypoint template; highest confidence.
+- **Case 2a (inner-alone)** -- only center_hole_inner with conf >= `INNER_ALONE_CONF` (0.8): conic back-projection from fitted ellipse -> true 3D circle center. Confidence = `inner.conf * 0.8`.
+- **Case 2a (outer-alone)** -- center_hole_outer only, AR > 1.3: conic back-projection. Confidence = `outer.conf * 0.7`.
+- **Case 2b (geometry match)** -- no center detection. Runs solvePnP on every detection with an ellipse (centers + guides), fits a 3D line via PCA in **camera space** (metric, rigid-transform-equivalent to world), then does combinatorial LSQ against full board template `_BOARD_OFFSETS_M = [-0.22, -0.08, 0.0, +0.08, +0.22]` m. Scale penalty `|s-1|*SCALE_WEIGHT=0.01` prefers s=1. Mirror ambiguity resolved with previous world estimate projected to pixels.
+- **Dedup** -- only center classes are deduplicated; all guide detections are kept.
+
+Output: `CenterHoleResult(center_xy, pose={'tvec_m','rvec'}, confidence, source, detections)`.
+
+#### World-space Tracker (`vision/yolo/world_tracker.py`)
+
+EMA filter in world coords (camera moves with robot, so image-space EMA is meaningless).
+
+- `update(result, cam_to_world, cam_origin_world)` -- transforms `tvec_cam` to world, blends.
+- **Confidence gate** `update_min_confidence=0.25` -- frames below threshold are treated as no-measurement and decay instead of polluting the EMA at 15 fps.
+- **Non-linear alpha**: `alpha = ema_alpha * conf ** conf_power` (conf_power=2.0) -- a 0.9-conf conic dominates many 0.3-conf line frames.
+- `decay=0.9` per missed frame, output gated by `min_confidence=0.1`.
+
+#### Consumer side (`src_robot/robot_test/macro_micro.py`, `src_robot/robot_main/tasks.py`)
+
+Vision node publishes world coords directly, so `VisionFeedback.get_pin_error(world_hole_xyz)` just does `hole[:2] - pin_world[:2]` using FK pin position. `_PbvsBase.start()` reads pre-computed world hole from robot state, sets as target, passes `world_raw` each step.
 
 #### COIN-Pose Model (`vision/yolo/coin_pose.py`)
 

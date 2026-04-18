@@ -54,32 +54,33 @@ TARGETS = {
         "shape"   : "slot",
         "size_lv1": (0.072, 0.04),   # (긴지름, 짧은지름)
         "size_lv2": 0.026,
-        "class_outer": 0,
-        "class_inner": 1,
+        # Class IDs — suffix "_B" = outer, no suffix = inner
+        "class_inner": 0,   # CenterHole
+        "class_outer": 1,   # CenterHole_B
     },
     "GUIDE_L": {
         "pos"     : [0.03, COMMON_Y, DEPTH_LV2],
         "shape"   : "circle",
         "size_lv1": 0.04,
         "size_lv2": 0.026,
-        "class_outer": 2,
-        "class_inner": 3,
+        "class_inner": 2,   # Hole
+        "class_outer": 3,   # Hole_B
     },
     "GUIDE_R": {
         "pos"     : [0.19, COMMON_Y, DEPTH_LV2],
         "shape"   : "circle",
         "size_lv1": 0.04,
         "size_lv2": 0.026,
-        "class_outer": 2,
-        "class_inner": 3,
+        "class_inner": 2,   # Hole
+        "class_outer": 3,   # Hole_B
     },
 }
 
 CLASS_NAMES = [
-    "center_hole_outer",
-    "center_hole_inner",
-    "guide_hole_outer",
-    "guide_hole_inner",
+    "center_hole_inner",   # 0: CenterHole
+    "center_hole_outer",   # 1: CenterHole_B
+    "guide_hole_inner",    # 2: Hole
+    "guide_hole_outer",    # 3: Hole_B
 ]
 
 MIN_MARKERS_REQUIRED = 3
@@ -89,10 +90,10 @@ CONTOUR_STEPS        = 9   # YOLO Pose: 9 Keypoints
 
 # 클래스별 색상 (BGR)
 CLASS_COLORS = [
-    (0,   200, 255),   # 0: center outer  - 하늘색
-    (0,   0,   255),   # 1: center inner  - 빨강
-    (0,   255, 100),   # 2: guide outer   - 연두 (L/R 공통)
-    (50,  200, 0  ),   # 3: guide inner   - 초록 (L/R 공통)
+    (0,   0,   255),   # 0: center inner  - 빨강
+    (0,   200, 255),   # 1: center outer  - 하늘색
+    (50,  200, 0  ),   # 2: guide inner   - 초록 (L/R 공통)
+    (0,   255, 100),   # 3: guide outer   - 연두 (L/R 공통)
 ]
 
 class AutoAnnotator:

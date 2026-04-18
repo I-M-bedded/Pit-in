@@ -39,13 +39,21 @@ class WorldTracker:
     ----------
     ema_alpha : float
         Base EMA coefficient (0 < alpha <= 1).  Actual alpha per frame is
-        ``ema_alpha * confidence``, so high-confidence frames update faster.
+        ``ema_alpha * confidence ** conf_power`` — confidence is squared by
+        default so low-conf Tier-2b frames barely move the filter.
     decay : float
         Multiplicative decay applied to stored confidence each frame when
         no new measurement arrives (0 < decay < 1).
     min_confidence : float
         Below this threshold the tracker reports ``None`` instead of the
-        stale EMA value.
+        stale EMA value (output gate).
+    update_min_confidence : float
+        Frames below this confidence are treated as "no measurement" —
+        we decay instead of blending them in.  Prevents noisy low-conf
+        frames from dominating at 15 fps where unreliable detections pile up.
+    conf_power : float
+        Exponent applied to confidence before scaling alpha.  ``2.0`` by
+        default — a 0.3-conf frame contributes 9x less than a 0.9-conf one.
     """
 
     def __init__(
@@ -53,10 +61,14 @@ class WorldTracker:
         ema_alpha: float = 0.3,
         decay: float = 0.9,
         min_confidence: float = 0.1,
+        update_min_confidence: float = 0.25,
+        conf_power: float = 2.0,
     ):
         self.ema_alpha = ema_alpha
         self.decay = decay
         self.min_confidence = min_confidence
+        self.update_min_confidence = update_min_confidence
+        self.conf_power = conf_power
 
         self._world_pos: Optional[np.ndarray] = None
         self._confidence: float = 0.0
@@ -90,18 +102,20 @@ class WorldTracker:
         if result.center_xy is None or result.pose is None:
             return self._decay_and_return(result.source)
 
+        # Confidence gate: drop this frame as if no measurement arrived.
+        # At 15 fps this prevents 15x/sec low-conf noise from eating the EMA.
+        if result.confidence < self.update_min_confidence:
+            return self._decay_and_return(result.source)
+
         # Camera-frame 3D position from solvePnP
         tvec_cam = np.array(result.pose["tvec_m"], dtype=np.float64)
 
         # Transform to world
         world_pos = cam_origin_world + (cam_to_world @ tvec_cam)
 
-        # NOTE: "line" source (Tier 2b) never reaches here because its pose is None
-        # → handled by _decay_and_return above. Symmetry ambiguity for "line" would
-        # require a 3D candidate, which is unavailable without depth. Future work.
-
-        # EMA update (alpha scaled by confidence)
-        alpha = self.ema_alpha * result.confidence
+        # EMA update with non-linear confidence scaling — quadratic default
+        # so a 0.9-conf conic frame dominates many 0.3-conf line frames.
+        alpha = self.ema_alpha * (result.confidence ** self.conf_power)
         if self._world_pos is None:
             self._world_pos = world_pos.copy()
             self._confidence = result.confidence

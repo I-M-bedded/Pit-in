@@ -129,10 +129,13 @@ class ControlConfig:
 # Module A: VisionFeedback
 # =============================================================================
 class VisionFeedback:
-    """Camera-frame error → robot-base-frame error converter.
+    """World-frame hole position → pin-to-hole error converter.
 
-    Side-aware: uses SIDE_CFG for camera mount rotation, offset, and so3.
-    Applies EMA low-pass filter for noise rejection.
+    Vision node (`vision_node.py`) publishes the filtered hole position in
+    the robot world frame directly on `/cam0`.  This class reads the
+    current pin world-position via FK and returns the 2D displacement.
+    Applies an EMA low-pass filter for extra smoothing on top of
+    WorldTracker's EMA.
     """
 
     def __init__(self, topik: ik.Topik, alpha: float = 0.3, side: str = 'left'):
@@ -143,26 +146,23 @@ class VisionFeedback:
         self.set_side(side)
 
     def set_side(self, side: str):
-        """Switch camera parameters for the given side."""
+        """Switch FK index for the given side."""
         self.side = side
-        cfg = SIDE_CFG[side]
-        self._cam_mount_R = cfg['cam_mount_R']
-        self._cam_offset = cfg['cam_offset']
-        self._so3_attr = cfg['so3_attr']
+        self._fk_idx = SIDE_CFG[side]['fk_idx']
 
-    def get_pin_error(self, cam_err: np.ndarray) -> np.ndarray:
-        """Transform raw camera error into world-frame pin-to-hole error.
+    def get_pin_error(self, world_hole_xyz: np.ndarray) -> np.ndarray:
+        """Compute world-frame pin-to-hole error.
 
         Args:
-            cam_err: [x, y, z] target error in camera frame (meter)
+            world_hole_xyz: [x, y, z] hole position in robot world frame (m),
+                            published by the vision node on /cam0.
 
         Returns:
-            world_err: [ex, ey] world frame error (m)
+            world_err: [ex, ey] world-frame pin-to-hole error (m).
         """
-        hole_local = self._cam_offset + self._cam_mount_R @ np.asarray(cam_err)
-        R_world_pin = getattr(self.topik, self._so3_attr)
-        hole_world_offset = np.asarray(R_world_pin @ hole_local).flatten()
-        return hole_world_offset[:2]
+        pin_world = np.asarray(self.topik.x[self._fk_idx], dtype=float).flatten()
+        hole_world = np.asarray(world_hole_xyz, dtype=float).flatten()
+        return hole_world[:2] - pin_world[:2]
 
     def update_error(self, raw_pin_err: np.ndarray) -> np.ndarray:
         """Apply EMA filter to the world pin error."""
@@ -328,29 +328,34 @@ class HybridController:
         self._settle_timer = 0.0
         self._obs_buffer = []
 
-    def step(self, cam_raw: Optional[np.ndarray] = None,
+    def step(self, world_raw: Optional[np.ndarray] = None,
                    current_c_pos: Optional[np.ndarray] = None) -> list:
         """Execute one control step.
-        
+
         Args:
-            cam_raw: [x, y, z] raw camera observation from /cam0 (meter), or None
+            world_raw: [x, y, z] hole position in world frame (from /cam0, m).
+                       Vision node already resolves camera→world and EMA-filters,
+                       so we only need pin-to-hole subtraction here.
             current_c_pos: [7] actual motor positions in encoder counts, or None
-        
+
         Returns:
             q_cmd_cnt: [7] motor position command in encoder counts (native int)
         """
-        # --- FK 갱신: 실제 모터 위치로 so3 동기화 ---
+        # --- FK 갱신: 실제 모터 count → Topik 정식 경로로 world FK 동기화 ---
+        # Keep the read path identical to vision_node:
+        #   JointState counts -> Topik.get_q() -> Topik.fk()
+        # This avoids subtle drift between manual cnt2m/sign handling here
+        # and the FK basis used to publish /cam0 world coordinates.
         if current_c_pos is not None:
-            actual_q = np.array(current_c_pos) * self.topik.cnt2m
-            actual_q[2] = -actual_q[2]
-            actual_q[3] = -actual_q[3]
-            actual_q[4] = -actual_q[4]
-            self.kin.fk_pin(actual_q, self.side)
+            q_cnt = np.asarray(current_c_pos, dtype=int)
+            self.topik.get_q(q_cnt)
+            self.topik.fk()
+            actual_q = self.topik.qm.copy()
 
-        # --- 카메라 Raw → 월드 에러 변환 ---
+        # --- World-frame hole → pin-to-hole error ---
         world_pin_err = None
-        if cam_raw is not None:
-            world_pin_err = self.vision.get_pin_error(np.asarray(cam_raw))
+        if world_raw is not None:
+            world_pin_err = self.vision.get_pin_error(np.asarray(world_raw))
         
         # --- State Machine ---
         if self.state == State.MACRO_ARM:
@@ -772,11 +777,11 @@ class HardwareInterface:
 def _run_side_sim(ctrl, hw, side, target_xy, max_iter=200, noise_std=0.0002):
     """Run simulation for one side.
 
-    Simulates camera error: target_xy - current_pin position,
-    expressed in camera frame (inverse of mount rotation).
+    Vision node now publishes hole position in world frame, so the sim
+    just feeds ``target_xy + noise`` as ``world_raw``.  The controller
+    subtracts the current pin world position internally.
     """
     ctrl.set_target(target_xy, side=side, cartype=0)
-    scfg = SIDE_CFG[side]
 
     print(f"\n--- {side.upper()} PIN ---")
     print(f"  Target: {target_xy}, State: {ctrl.state.name}")
@@ -791,21 +796,13 @@ def _run_side_sim(ctrl, hw, side, target_xy, max_iter=200, noise_std=0.0002):
         # Simulate c_pos (actual motor position ≈ commanded)
         sim_c_pos = q_to_cpos(ctrl.q_cmd)
 
-        # Simulate camera: world error → camera frame
-        true_pin = ctrl.kin.fk_pin(ctrl.q_cmd, side)
-        world_err_xy = target_xy - true_pin
+        # Simulated vision: true hole world position + noise, z arbitrary.
         noise = np.random.randn(2) * noise_std
-        world_err_xy += noise
+        world_raw = np.array([target_xy[0] + noise[0],
+                              target_xy[1] + noise[1],
+                              0.0])
 
-        # Inverse transform: world → camera frame (simplified for sim)
-        # cam_err_3d = R_mount^T @ R_world_pin^T @ [wx, wy, 0]
-        R_mount = scfg['cam_mount_R']
-        R_world = getattr(ctrl.topik, scfg['so3_attr'])
-        offset = scfg['cam_offset']
-        local_err = np.asarray(np.array(R_world).T @ np.array([world_err_xy[0], world_err_xy[1], 0.0])).flatten()
-        cam_err_3d = R_mount.T @ (local_err - offset)
-
-        q_cnt = ctrl.step(cam_raw=cam_err_3d, current_c_pos=np.array(sim_c_pos))
+        q_cnt = ctrl.step(world_raw=world_raw, current_c_pos=np.array(sim_c_pos))
         ctrl.q_cmd = hw.apply_safety_limits(ctrl.q_cmd)
 
         if ctrl.is_done:

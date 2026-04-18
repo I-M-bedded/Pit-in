@@ -442,7 +442,13 @@ class VisionTask(BaseTask):
         print(f"[SUCCESS] Calibration data saved. Detected Markers: {sorted_ids}")
 
 class _PbvsBase(BaseTask):
-    """Single-side Macro-Micro PBVS task base."""
+    """Single-side Macro-Micro PBVS task base.
+
+    Vision node publishes hole position in the robot world frame on /cam0
+    (left) / /cam1 (right).  We feed that world point straight into the
+    HybridController, so both ``target_xy`` and ``world_raw`` are expressed
+    in world coordinates — no pin/camera transforms needed here.
+    """
     SIDE: str = ''
 
     def __init__(self, robot):
@@ -452,23 +458,14 @@ class _PbvsBase(BaseTask):
     def start(self):
         if not self.is_active:
             self.is_active = True
-            cam_err = self._get_cam_data(self.SIDE)
-            self.ctrl.vision.set_side(self.SIDE)
-            bot_err = self.ctrl.vision.get_pin_error(cam_err)
-
-            current_q = np.array(self.robot.c_pos) * self.robot.topik.cnt2m
-            current_q[2] = -current_q[2]
-            current_q[3] = -current_q[3]
-            current_q[4] = -current_q[4]
-
-            current_pin = self.ctrl.kin.fk_pin(current_q, self.SIDE)
-            target_xy = current_pin + bot_err[:2]
+            world_hole = self._get_world_hole(self.SIDE)
+            target_xy = world_hole[:2]
 
             self.ctrl.set_target(target_xy, side=self.SIDE, cartype=self.robot.agv.cartype)
             self.robot.t_action = [0] * 7
-            print(f"PBVS Task Started — {self.SIDE} pin (Target: {target_xy})")
+            print(f"PBVS Task Started — {self.SIDE} pin (world target: {target_xy})")
 
-    def _get_cam_data(self, side):
+    def _get_world_hole(self, side):
         if side == 'left':
             return np.array(self.robot.agv.lcam_hole_pos, dtype=float)
         else:
@@ -477,10 +474,10 @@ class _PbvsBase(BaseTask):
     def run(self):
         if not self.is_active: return
 
-        cam_raw = self._get_cam_data(self.SIDE)
+        world_raw = self._get_world_hole(self.SIDE)
         c_pos = np.array(self.robot.c_pos, dtype=float)
 
-        q_cnt = self.ctrl.step(cam_raw=cam_raw, current_c_pos=c_pos)
+        q_cnt = self.ctrl.step(world_raw=world_raw, current_c_pos=c_pos)
 
         for i in range(7):
             self.robot.t_action[i] = 0

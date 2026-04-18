@@ -4,14 +4,14 @@ Vision Node — ROS2 node for robust center-hole pose estimation.
 AGX Orin tuned: TensorRT engine, FP16, CUDA warm-up.
 
 Camera: Intel RealSense (pyrealsense2), color only — depth not used.
-Output: /cam0 (geometry_msgs/Point) — camera-frame 3D position [m]
+Output: /cam0 (geometry_msgs/Point) — **world-frame** 3D position [m]
 
 Pipeline per frame:
     1. RealSense → color frame
     2. HolePoseEstimator.estimate(color) → result (solvePnP tvec + confidence)
     3. WorldTracker: tvec → world-space EMA (via robot FK from /agv_joint_state)
-    4. Back-project filtered world_xyz → camera frame
-    5. Publish Point(x, y, z) on /cam0
+    4. Publish world_xyz Point(x, y, z) directly on /cam0
+       (downstream controllers operate in world space; no extra transform.)
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
 
-from hole_pose_estimator import HolePoseEstimator
+from hole_pose_estimator import CLASS_ID_TO_NAME, HolePoseEstimator
 from world_tracker import WorldTracker
 
 try:
@@ -91,7 +91,7 @@ class VisionNode(Node):
         weights_path: str,
         side: str = "left",
         device: str = "cuda:0",
-        conf_threshold: float = 0.5,
+        conf_threshold: float = 0.3,
         width: int = 640,
         height: int = 480,
         fps: int = 30,
@@ -99,10 +99,13 @@ class VisionNode(Node):
         half: bool = False,
         hz: float = 15.0,
         robot_version: int = 4,
+        debug: bool = False,
     ):
         super().__init__("vision_node")
         self.side = side
         self.show_gui = show_gui
+        self.debug = debug
+        self._warned_missing_world_fk = False
 
         # -- RealSense: color only (depth removed, not used) --
         self.rs_pipeline = rs.pipeline()
@@ -157,8 +160,16 @@ class VisionNode(Node):
             )
             self.get_logger().info("FK wired to /agv_joint_state.")
         else:
+            missing = []
+            if not _HAS_JOINT_MSG:
+                missing.append("pitin_msgs.msg.JointState")
+            if not _HAS_TOPIK:
+                missing.append("controller.ik.Topik")
+            missing_str = ", ".join(missing) if missing else "unknown dependency"
             self.get_logger().warn(
-                "FK unavailable (pitin_msgs or ik not found) — "
+                "FK unavailable because import failed for "
+                f"{missing_str}. Build/source the ROS2 workspace that provides "
+                "`pitin_msgs`, then restart vision_node. "
                 "WorldTracker runs in camera-space fallback mode."
             )
 
@@ -223,6 +234,10 @@ class VisionNode(Node):
 
         return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
 
+    def _has_world_frame(self) -> bool:
+        """Return True when FK is available and world-frame publishing is valid."""
+        return self._fk_ready and self._topik is not None
+
     def _compute_prior_xy(
         self, cam_to_world: np.ndarray, cam_origin: np.ndarray
     ) -> Optional[np.ndarray]:
@@ -272,34 +287,115 @@ class VisionNode(Node):
         # 4. World-space EMA (ambiguity resolution + temporal filter)
         world_est = self.tracker.update(result, cam_to_world, cam_origin)
 
-        # 5. Back-project filtered world → camera frame for /cam0
-        #    world_xyz = cam_origin + cam_to_world @ tvec_cam
-        #    ∴ tvec_cam = cam_to_world.T @ (world_xyz - cam_origin)  (rotation is orthogonal)
-        msg = Point()
-        if world_est.world_xyz is not None:
-            tvec_cam = cam_to_world.T @ (world_est.world_xyz - cam_origin)
-            msg.x = float(tvec_cam[0])
-            msg.y = float(tvec_cam[1])
-            msg.z = float(tvec_cam[2])
+        # 5. Publish only valid world-frame points.
+        #    When FK is not ready, WorldTracker is in camera-space fallback mode,
+        #    so publishing would mislabel camera coordinates as robot coordinates.
+        if self._has_world_frame() and world_est.world_xyz is not None:
+            msg = Point()
+            msg.x = float(world_est.world_xyz[0])
+            msg.y = float(world_est.world_xyz[1])
+            msg.z = float(world_est.world_xyz[2])
+            self.pub_point.publish(msg)
             self.get_logger().info(
                 f"[{world_est.source}] conf={world_est.confidence:.2f}  "
-                f"x={msg.x:.4f} y={msg.y:.4f} z={msg.z:.4f}"
+                f"world x={msg.x:.4f} y={msg.y:.4f} z={msg.z:.4f}"
             )
-        self.pub_point.publish(msg)
+            self._warned_missing_world_fk = False
+        elif result.pose is not None and not self._has_world_frame() and not self._warned_missing_world_fk:
+            self.get_logger().warn(
+                "Skipping /cam publish because FK from /agv_joint_state is not ready yet. "
+                "Raw pose exists, but robot/world coordinates are not valid."
+            )
+            self._warned_missing_world_fk = True
+
+        if self.debug:
+            self._log_debug(result, world_est, cam_to_world, cam_origin)
 
         # 5. GUI
         if self.show_gui:
-            vis = color_image.copy()
-            if result.center_xy is not None:
-                cu = int(round(result.center_xy[0]))
-                cv_y = int(round(result.center_xy[1]))
-                color = (0, 255, 0) if result.source == "conic" else (0, 255, 255)
-                cv2.circle(vis, (cu, cv_y), 6, color, -1)
-                cv2.putText(vis, f"{result.source} {result.confidence:.2f}",
-                            (cu + 10, cv_y - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, color, 1)
+            vis = self._draw_overlay(color_image, result, world_est)
             cv2.imshow("Vision Node", vis)
             cv2.waitKey(1)
+
+    # ------------------------------------------------------------------
+    #  Debug helpers
+    # ------------------------------------------------------------------
+
+    def _log_debug(self, result, world_est, cam_to_world, cam_origin):
+        """Log per-frame detections, raw camera tvec, and robot/world coords."""
+        parts = []
+        for d in result.detections:
+            cname = CLASS_ID_TO_NAME.get(d["class_id"], f"cls{d['class_id']}")
+            parts.append(f"{cname}:{d['conf']:.2f}")
+        dets_str = ", ".join(parts) if parts else "no detections"
+
+        raw_tvec_str = "none"
+        raw_world_str = "unavailable"
+        if result.pose is not None and "tvec_m" in result.pose:
+            tvec_cam = np.array(result.pose["tvec_m"], dtype=np.float64)
+            raw_tvec_str = (
+                f"[{tvec_cam[0]:.4f}, {tvec_cam[1]:.4f}, {tvec_cam[2]:.4f}]"
+            )
+            if self._has_world_frame():
+                raw_world = cam_origin + (cam_to_world @ tvec_cam)
+                raw_world_str = (
+                    f"[{raw_world[0]:.4f}, {raw_world[1]:.4f}, {raw_world[2]:.4f}]"
+                )
+
+        filt_world_str = "none"
+        if self._has_world_frame() and world_est.world_xyz is not None:
+            filt = np.asarray(world_est.world_xyz, dtype=np.float64)
+            filt_world_str = f"[{filt[0]:.4f}, {filt[1]:.4f}, {filt[2]:.4f}]"
+
+        self.get_logger().info(
+            f"[DEBUG] src={result.source} frame_conf={result.confidence:.2f} "
+            f"ema_conf={world_est.confidence:.2f} fk_ready={self._has_world_frame()} "
+            f"cam_tvec={raw_tvec_str} raw_world={raw_world_str} "
+            f"filt_world={filt_world_str} | {dets_str}"
+        )
+
+    def _draw_overlay(self, color_image: np.ndarray, result, world_est) -> np.ndarray:
+        """Draw every detection's bbox, class name, conf + the fused center."""
+        vis = color_image.copy()
+
+        # Per-detection bbox + class+conf label.  Color by class.
+        palette = {
+            0: (  0, 255,   0),  # CENTER_INNER (CenterHole)    — green
+            1: (255, 128,   0),  # CENTER_OUTER (CenterHole_B)  — orange
+            2: (255,   0, 255),  # GUIDE_INNER  (Hole)          — magenta
+            3: (200, 200, 255),  # GUIDE_OUTER  (Hole_B)        — pink
+        }
+        for d in result.detections:
+            x1, y1, x2, y2 = [int(round(v)) for v in d["bbox"]]
+            cid = d["class_id"]
+            color = palette.get(cid, (180, 180, 180))
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 1)
+            cname = CLASS_ID_TO_NAME.get(cid, f"cls{cid}")
+            label = f"{cname} {d['conf']:.2f}"
+            cv2.putText(vis, label, (x1, max(15, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+            if d["ellipse"] is not None:
+                ecx, ecy = d["ellipse"]["center_xy"]
+                cv2.circle(vis, (int(round(ecx)), int(round(ecy))), 3, color, -1)
+
+        # Fused center (output of estimator).
+        if result.center_xy is not None:
+            cu = int(round(result.center_xy[0]))
+            cv_y = int(round(result.center_xy[1]))
+            ccolor = (0, 255, 0) if result.source == "conic" else (0, 255, 255)
+            cv2.circle(vis, (cu, cv_y), 7, ccolor, 2)
+            cv2.putText(vis, f"{result.source} f={result.confidence:.2f} ema={world_est.confidence:.2f}",
+                        (cu + 10, cv_y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, ccolor, 1)
+
+        # Top-left banner with counts.
+        banner = (
+            f"side={self.side}  dets={len(result.detections)}  "
+            f"src={result.source}  fk={int(self._has_world_frame())}"
+        )
+        cv2.putText(vis, banner, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 1)
+        return vis
 
     # ------------------------------------------------------------------
 
@@ -329,6 +425,8 @@ def main():
                     help="Auto-export .pt → TensorRT .engine before starting")
     ap.add_argument("--robot-version", type=int, default=4)
     ap.add_argument("--no-gui", action="store_true")
+    ap.add_argument("--debug", action="store_true",
+                    help="Per-frame detection log + richer GUI overlay")
     args = ap.parse_args()
 
     weights = args.weights
@@ -348,6 +446,7 @@ def main():
         half=args.half,
         hz=args.hz,
         robot_version=args.robot_version,
+        debug=args.debug,
     )
     try:
         rclpy.spin(node)

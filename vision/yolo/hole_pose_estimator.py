@@ -25,6 +25,7 @@ Notes on geometry:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 from dataclasses import dataclass, field
@@ -53,11 +54,16 @@ from train_retinex_baseline import (
 )
 
 
+# Class naming convention (as used in training data):
+#   suffix "_B" → outer rim (larger, slot for center / 4cm circle for guide)
+#   no suffix   → inner deep hole (26mm circle)
+# Training class IDs: 0 = CenterHole (inner), 1 = CenterHole_B (outer),
+#                     2 = Hole        (inner), 3 = Hole_B        (outer).
 CLASS_ID_TO_NAME = {
-    0: "center_hole_outer",
-    1: "center_hole_inner",
-    2: "guide_hole_outer",
-    3: "guide_hole_inner",
+    0: "center_hole_inner",
+    1: "center_hole_outer",
+    2: "guide_hole_inner",
+    3: "guide_hole_outer",
 }
 
 # Mirrored from vision/dataset_gen/auto_annotator.py.
@@ -68,6 +74,12 @@ GEOMETRY_SPECS = {
     "guide_hole_outer": {"shape": "circle", "size": 0.040},
     "guide_hole_inner": {"shape": "circle", "size": 0.026},
 }
+
+# Experimental board layout:  H — 14cm — H — 8cm — C — 8cm — H — 14cm — H
+# Offsets of every hole CENTER from the board centre along the row [m].
+# Case-2b enumerates subsets of these to match any mixed detection cloud
+# (guides + low-confidence center all count as observation candidates).
+_BOARD_OFFSETS_M = np.array([-0.22, -0.08, 0.0, 0.08, 0.22], dtype=np.float64)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 PNP_METHOD_NAMES = {
@@ -294,12 +306,13 @@ class HolePoseEstimator:
     Temporal EMA filter smooths the output with belief-weighted alpha.
     """
 
-    CENTER_OUTER = 0   # CenterHole_B  (slot 0.072x0.040)
-    CENTER_INNER = 1   # CenterHole    (circle d=0.026)
-    GUIDE_OUTER = 2
-    GUIDE_INNER = 3
+    CENTER_INNER = 0   # CenterHole     (circle d=0.026)
+    CENTER_OUTER = 1   # CenterHole_B   (slot 0.072 x 0.040)
+    GUIDE_INNER  = 2   # Hole           (circle d=0.026)
+    GUIDE_OUTER  = 3   # Hole_B         (circle d=0.040)
 
-    OUTER_AR_THRESHOLD = 1.3  # aspect-ratio gate for slot verification
+    OUTER_AR_THRESHOLD = 1.3   # aspect-ratio gate for slot verification
+    INNER_ALONE_CONF   = 0.8   # inner-only conic trigger in Case 2a
 
     def __init__(
         self,
@@ -309,7 +322,7 @@ class HolePoseEstimator:
         device: str = "cuda:0",
         conf_threshold: float = 0.5,
         kp_conf: float = 0.15,
-        reliability_threshold: float = 0.6,
+        reliability_threshold: float = 0.4,
         sigma: float = 20.0,
         half: bool = False,
         imgsz: int = 640,
@@ -384,12 +397,12 @@ class HolePoseEstimator:
         keypoints = result.keypoints.data.cpu().numpy()
 
         # Build all detections
-        all_dets: dict[int, list] = {}
+        all_dets: List[dict] = []
         for i in range(len(boxes)):
             kxy = keypoints[i, :, :2].astype(np.float64)
             kc = keypoints[i, :, 2].astype(np.float64)
             ell = fit_boundary_ellipse(kxy[1:], kc[1:], self.kp_conf)
-            d = {
+            all_dets.append({
                 "class_id": int(classes[i]),
                 "conf": float(scores[i]),
                 "bbox": boxes[i],
@@ -398,14 +411,21 @@ class HolePoseEstimator:
                 "kpts_xy": kxy,
                 "kpts_conf": kc,
                 "ellipse": ell,
-            }
-            all_dets.setdefault(d["class_id"], []).append(d)
+            })
 
-        # Keep only the highest-conf detection per class
-        dets = []
-        for cls_dets in all_dets.values():
-            dets.append(max(cls_dets, key=lambda d: d["conf"]))
-        return dets
+        # Dedup ONLY the CENTER classes (single center target per frame).
+        # GUIDE detections are kept in full — the experimental board has 4.
+        center_by_cls: dict[int, dict] = {}
+        guides: List[dict] = []
+        for d in all_dets:
+            cid = d["class_id"]
+            if cid in (self.CENTER_OUTER, self.CENTER_INNER):
+                cur = center_by_cls.get(cid)
+                if cur is None or d["conf"] > cur["conf"]:
+                    center_by_cls[cid] = d
+            else:
+                guides.append(d)
+        return list(center_by_cls.values()) + guides
 
     # ------------------------------------------------------------------
     #  Tier 1 — conic recovery (inner circle)
@@ -450,8 +470,30 @@ class HolePoseEstimator:
         prior_xy: Optional[np.ndarray] = None,
     ) -> CenterHoleResult:
         # ------------------------------------------------------------------
-        # Case 2a: CenterHole_B (outer) present and AR-verified → conic recovery
+        # Case 2a: single reliable center detection → conic recovery.
+        #
+        #   Preference order:
+        #     i.  CenterHole (inner) alone with conf ≥ INNER_ALONE_CONF.
+        #         Inner is a true circle → conic back-projection is exact.
+        #     ii. CenterHole_B (outer) AR-verified as a slot.
+        #         Conic formula is an approximation on the slot but still
+        #         the best we have when the inner is missing.
         # ------------------------------------------------------------------
+        inner = self._best_of_class(dets, self.CENTER_INNER)
+        if (inner is not None
+                and inner["ellipse"] is not None
+                and inner["conf"] >= self.INNER_ALONE_CONF):
+            corrected = conic_center_recovery(inner["ellipse"], self.K)
+            if corrected is not None:
+                center, _ = corrected
+                source = "conic"
+            else:
+                center = inner["ellipse"]["center_xy"].copy()
+                source = "ellipse"
+            pose = self._solve_for(inner, center)
+            return CenterHoleResult(center_xy=center, confidence=inner["conf"] * 0.8,
+                                    source=source, pose=pose)
+
         outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
         if outer is not None and outer["ellipse"] is not None:
             corrected = conic_center_recovery(outer["ellipse"], self.K)
@@ -466,57 +508,161 @@ class HolePoseEstimator:
                                     source=source, pose=pose)
 
         # ------------------------------------------------------------------
-        # Case 2b: no reliable single detection → line fitting on all keypoints
+        # Case 2b: no reliable center-conic recovery → match ANY detection
+        #          cloud to the full board template **in camera 3D (metric)**.
         #
-        # Each detection contributes up to 2 points to the cloud:
-        #   · boundary kp1-kp8 → ellipse fitting → ellipse center
-        #   · center kp0       → used directly
+        # Board layout & offsets (m):  -0.22  -0.08   0.00  +0.08  +0.22
+        #                                 H      H     C      H      H
         #
-        # Symmetric hole layout causes direction ambiguity on the fitted line.
-        # prior_xy (previous center-hole pixel, from WorldTracker back-projection)
-        # is used to resolve which end of the line is the correct center direction.
-        # Exact hole-position offsets along the line are TODO (user to define).
+        # We include BOTH guide AND center-class detections in the cloud.
+        # A low-confidence CenterHole that wasn't good enough for conic in
+        # Case 2a is still a strong geometric anchor — letting it contribute
+        # to the line fit / template match means e.g. a 3-point cloud with
+        # gaps (8 cm, 14 cm) correctly identifies its leftmost point as
+        # the center (subset {0, +0.08, +0.22}).
+        #
+        # Per-detection solvePnP gives a metric tvec in camera frame.  We fit
+        # a 3-D line through those tvecs, project onto it (meters), then
+        # enumerate every size-k subset of `_BOARD_OFFSETS_M` and solve
+        # ``proj_i = s * offset_i + c`` in LSQ.  Physically ``s`` must be ≈ 1,
+        # so we (a) fold a negative ``s`` onto a direction flip and
+        # (b) penalise |s − 1| in the score.
+        #
+        # prior_xy (WorldTracker → pixel) breaks the remaining axis-direction
+        # ambiguity by comparing projected pixel candidates.
         # ------------------------------------------------------------------
-        pts = []
-        valid_dets_for_conf = []
-        for d in dets:
-            added = False
-            if d["ellipse"] is not None:
-                pts.append(d["ellipse"]["center_xy"])
-                added = True
-            if d["kp0_conf"] >= self.kp_conf:
-                pts.append(d["kp0_xy"])
-                added = True
-            if added:
-                valid_dets_for_conf.append(d)
-
-        if len(pts) < 2:
+        cloud_dets = [d for d in dets if d["ellipse"] is not None]
+        if len(cloud_dets) < 2:
             return CenterHoleResult()
 
-        pts = np.array(pts, dtype=np.float64)
-        mean = pts.mean(axis=0)
-        _, _, Vt = np.linalg.svd(pts - mean)
-        direction = Vt[0]
-        projs = (pts - mean) @ direction
+        # Per-detection solvePnP → metric tvecs in camera frame.
+        solved: List[Tuple[dict, dict, np.ndarray]] = []
+        for d in cloud_dets:
+            p = self._solve_for(d, d["ellipse"]["center_xy"])
+            if p is None:
+                continue
+            tvec = np.array(p["tvec_m"], dtype=np.float64)
+            if tvec[2] <= 0.0:
+                continue
+            solved.append((d, p, tvec))
 
-        # Midpoint of projected range as initial center estimate
-        mid = (projs.max() + projs.min()) / 2.0
-        estimated = mean + mid * direction
+        if len(solved) < 2:
+            return CenterHoleResult()
 
-        # Direction disambiguation using world prior
-        # The symmetric layout produces a mirror candidate:
-        #   candidate A = mean + mid * direction
-        #   candidate B = mean - mid * direction (reflection through mean)
-        # Pick the one closer to prior_xy.
+        tvecs = np.stack([s[2] for s in solved], axis=0)  # (k, 3) meters
+
+        matched = self._case2b_geometry_center_3d(tvecs, prior_xy)
+        if matched is None:
+            return CenterHoleResult()
+
+        center_tvec_cam, residual_m, scale = matched
+
+        # Project 3-D center back to pixel for GUI / next-frame prior.
+        center_xy = self._project_cam_to_pixel(center_tvec_cam)
+        if center_xy is None:
+            return CenterHoleResult()
+
+        # Build a pose dict around the geometric center.  Borrow the best
+        # guide's rvec for orientation (the board is planar, so all guides
+        # share the same plane normal).
+        best = max(solved, key=lambda s: s[0]["conf"])
+        pose = dict(best[1])
+        pose["tvec_m"] = center_tvec_cam.tolist()
+        pose["xyz_m"] = center_tvec_cam.tolist()
+        pose["source"] = "case2b_line3d"
+        pose["line_residual_m"] = residual_m
+        pose["line_scale"] = scale
+
+        avg_conf = float(np.mean([s[0]["conf"] for s in solved]))
+        # 5 mm residual ≈ "quite good" on this board.
+        residual_gain = 1.0 / (1.0 + residual_m / 0.005)
+        return CenterHoleResult(
+            center_xy=center_xy,
+            confidence=avg_conf * 0.4 * residual_gain,
+            source="line",
+            pose=pose,
+        )
+
+    # ------------------------------------------------------------------
+    #  Case 2b — 3-D geometry matching helpers
+    # ------------------------------------------------------------------
+
+    def _case2b_geometry_center_3d(
+        self,
+        tvecs: np.ndarray,
+        prior_xy: Optional[np.ndarray],
+    ) -> Optional[Tuple[np.ndarray, float, float]]:
+        """Match observed tvecs (camera-frame, m) to ``_BOARD_OFFSETS_M``.
+
+        Returns
+        -------
+        (center_tvec_cam, residual_m, scale) or None
+            * center_tvec_cam : (3,) center hole position in camera frame [m]
+            * residual_m      : rms of the 1-D LSQ fit along the line [m]
+            * scale           : LSQ slope (expected ≈ 1.0)
+        """
+        k = tvecs.shape[0]
+        if k < 2:
+            return None
+
+        mean_3d = tvecs.mean(axis=0)
+        _, _, Vt = np.linalg.svd(tvecs - mean_3d)
+        direction_3d = Vt[0]                          # unit vec along the row
+        projs_1d = (tvecs - mean_3d) @ direction_3d   # meters
+
+        order = np.argsort(projs_1d)
+        projs_sorted = projs_1d[order]
+
+        # Physical prior: slope should be ≈ 1.  Combine residual with |s - 1|.
+        SCALE_WEIGHT = 0.01  # meters contribution per unit scale-error
+        best: Optional[tuple] = None  # (score, residual, center_3d, dir, s)
+
+        for combo in itertools.combinations(_BOARD_OFFSETS_M, k):
+            offsets = np.array(combo, dtype=np.float64)  # already ascending
+            A = np.column_stack([offsets, np.ones_like(offsets)])
+            sol, *_ = np.linalg.lstsq(A, projs_sorted, rcond=None)
+            s, c = float(sol[0]), float(sol[1])
+            if s < 0.0:
+                s, c = -s, -c
+                direction_try = -direction_3d
+            else:
+                direction_try = direction_3d
+            residual = float(np.linalg.norm(A @ np.array([s, c]) - projs_sorted))
+            score = residual + SCALE_WEIGHT * abs(s - 1.0)
+            center_3d = mean_3d + c * direction_try
+            if best is None or score < best[0]:
+                best = (score, residual, center_3d, direction_try, s)
+
+        if best is None:
+            return None
+
+        _, residual, center_3d, direction, scale = best
+
+        # Mirror disambiguation via pixel prior.  Flipping the line direction
+        # mirrors the center through `mean_3d` (c → -c).
         if prior_xy is not None:
-            candidate_b = mean - mid * direction
-            if (np.linalg.norm(candidate_b - prior_xy) <
-                    np.linalg.norm(estimated - prior_xy)):
-                estimated = candidate_b
+            c_proj = float(np.dot(center_3d - mean_3d, direction))
+            mirror_3d = mean_3d - c_proj * direction
+            center_px = self._project_cam_to_pixel(center_3d)
+            mirror_px = self._project_cam_to_pixel(mirror_3d)
+            if (center_px is not None and mirror_px is not None
+                    and np.linalg.norm(mirror_px - prior_xy)
+                        < np.linalg.norm(center_px - prior_xy)):
+                center_3d = mirror_3d
 
-        avg_conf = float(np.mean([d["conf"] for d in valid_dets_for_conf]))
-        return CenterHoleResult(center_xy=estimated, confidence=avg_conf * 0.4,
-                                source="line")
+        return center_3d, residual, scale
+
+    def _project_cam_to_pixel(self, pt_cam: np.ndarray) -> Optional[np.ndarray]:
+        """Pinhole project a 3-D camera-frame point to pixel (u, v) or None."""
+        Z = float(pt_cam[2])
+        if Z <= 0.0:
+            return None
+        fx = float(self.K[0, 0]); fy = float(self.K[1, 1])
+        cx = float(self.K[0, 2]); cy = float(self.K[1, 2])
+        return np.array(
+            [fx * pt_cam[0] / Z + cx, fy * pt_cam[1] / Z + cy],
+            dtype=np.float64,
+        )
 
     # ------------------------------------------------------------------
     #  Helpers
