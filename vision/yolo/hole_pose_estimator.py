@@ -470,14 +470,14 @@ class HolePoseEstimator:
         prior_xy: Optional[np.ndarray] = None,
     ) -> CenterHoleResult:
         # ------------------------------------------------------------------
-        # Case 2a: single reliable center detection → conic recovery.
+        # Case 2a: single reliable center detection.
         #
         #   Preference order:
         #     i.  CenterHole (inner) alone with conf ≥ INNER_ALONE_CONF.
         #         Inner is a true circle → conic back-projection is exact.
         #     ii. CenterHole_B (outer) AR-verified as a slot.
-        #         Conic formula is an approximation on the slot but still
-        #         the best we have when the inner is missing.
+        #         Outer slot geometry is often less stable, so use the model's
+        #         center keypoint directly instead of conic recovery.
         # ------------------------------------------------------------------
         inner = self._best_of_class(dets, self.CENTER_INNER)
         if (inner is not None
@@ -496,13 +496,8 @@ class HolePoseEstimator:
 
         outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
         if outer is not None and outer["ellipse"] is not None:
-            corrected = conic_center_recovery(outer["ellipse"], self.K)
-            if corrected is not None:
-                center, _ = corrected
-                source = "conic"
-            else:
-                center = outer["ellipse"]["center_xy"].copy()
-                source = "ellipse"
+            center = outer["kpts_xy"][0].copy()
+            source = "kp0"
             pose = self._solve_for(outer, center)
             return CenterHoleResult(center_xy=center, confidence=outer["conf"] * 0.7,
                                     source=source, pose=pose)
