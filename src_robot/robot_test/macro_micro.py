@@ -302,6 +302,8 @@ class HybridController:
         # Current joint command in (m, rad)
         self.q_cmd = np.zeros(7)
         self.q_cmd_cnt = [0] * 7
+        self._measured_q = np.zeros(7)
+        self._selected_arm_branch = ""
 
         # Phase targets [x, y] in robot/world frame (meter).
         # Macro uses the task-start snapshot. Micro latches a fresh snapshot
@@ -365,6 +367,7 @@ class HybridController:
             self.topik.get_q(q_cnt)
             self.topik.fk()
             actual_q = self.topik.qm.copy()
+            self._measured_q = actual_q.copy()
 
         # --- World-frame hole → pin-to-hole error ---
         world_pin_err = None
@@ -411,23 +414,25 @@ class HybridController:
 
     # ----- Geometry Planner (Analytical 2-Link IK) -----
 
-    def _geometry_plan_arm(self, target_xy: np.ndarray, side: str = 'left') -> Tuple[float, float, bool]:
+    def _geometry_plan_arm(self, target_xy: np.ndarray, side: str = 'left') -> Tuple[float, float, bool, str, list]:
         """Analytical 2-link planar arm IK with current stage offsets locked.
 
         ``target_xy`` is a world-frame point.  During macro planning the stage
         axes stay at their current values, so we first remove the current stage
         translation and solve only the 2-link arm geometry.  For each side we
-        generate the two elbow branches, then choose the branch that stays
-        closest to the current arm configuration while still satisfying limits.
+        generate the two elbow branches, then choose the branch that keeps the
+        same target residual while preferring the smaller rtZ motion.
         """
         d2 = self.topik.d2
         d3_1 = self.topik.d3[1]
         wi = SIDE_CFG[side]['wing_joint']
+        measured_q = self._measured_q.copy()
+        saved_qm = self.topik.qm.copy()
 
         # Lock current stage offsets and solve the arm-only target in that
         # translated frame.  FK uses x=q0+..., y=-q1+..., so we invert that here.
-        tx = float(target_xy[0] - self.topik.qm[0] - self.topik.x0)
-        ty = float(target_xy[1] + self.topik.qm[1] - self.topik.y0)
+        tx = float(target_xy[0] - measured_q[0] - self.topik.x0)
+        ty = float(target_xy[1] + measured_q[1] - self.topik.y0)
 
         if side == 'left':
             link1_vec = np.array([-d2[1], d2[0]], dtype=float)
@@ -459,11 +464,11 @@ class HybridController:
         c2 = float(np.clip(c2, -1.0, 1.0))
         s2_abs = float(np.sqrt(max(0.0, 1.0 - c2 * c2)))
 
-        current_q2 = float(self.topik.qm[2])
-        current_wing = float(self.topik.qm[wi])
+        current_q2 = float(measured_q[2])
+        current_wing = float(measured_q[wi])
         candidates = []
 
-        for s2 in (s2_abs, -s2_abs):
+        for branch_idx, s2 in enumerate((s2_abs, -s2_abs)):
             theta2 = float(np.arctan2(s2, c2))
             theta1 = float(np.arctan2(ty, tx) - np.arctan2(L2 * s2, L1 + L2 * c2))
 
@@ -473,7 +478,7 @@ class HybridController:
             rtZ = (rtZ + np.pi) % (2 * np.pi) - np.pi
             wing = (wing + np.pi) % (2 * np.pi) - np.pi
 
-            q_try = self.topik.qm.copy()
+            q_try = measured_q.copy()
             q_try[2] = rtZ
             q_try[wi] = wing
             q_limited = self.hw.apply_safety_limits(q_try)
@@ -482,12 +487,42 @@ class HybridController:
                        abs(q_limited[wi] - wing) > 1e-9)
             pin_try = self.kin.fk_pin(q_limited, side)
             residual = float(np.linalg.norm(np.asarray(target_xy[:2], dtype=float) - pin_try))
-            delta = abs(q_limited[2] - current_q2) + abs(q_limited[wi] - current_wing)
+            q2_delta = abs(q_limited[2] - current_q2)
+            wing_delta = abs(q_limited[wi] - current_wing)
+            delta = q2_delta + wing_delta
 
-            candidates.append((clipped, residual, delta, float(q_limited[2]), float(q_limited[wi])))
+            candidates.append({
+                'branch': branch_idx,
+                'clipped': clipped,
+                'residual': residual,
+                'q2_delta': q2_delta,
+                'wing_delta': wing_delta,
+                'delta': delta,
+                'rtZ': float(q_limited[2]),
+                'wing': float(q_limited[wi]),
+            })
 
-        _, _, _, rtZ_best, wing_best = min(candidates, key=lambda item: (item[0], item[1], item[2]))
-        return rtZ_best, wing_best, clamped
+        # When both IK branches are effectively equivalent in residual, treat
+        # them as ambiguous and explicitly prefer the one with less rtZ motion.
+        unclipped = [item for item in candidates if not item['clipped']]
+        residual_pool = unclipped if unclipped else candidates
+        min_residual = min(item['residual'] for item in residual_pool)
+        ambiguity_tol = 5e-4  # 0.5 mm
+        ambiguous = [
+            item for item in residual_pool
+            if item['residual'] <= min_residual + ambiguity_tol
+        ]
+        best = min(
+            ambiguous,
+            key=lambda item: (
+                item['q2_delta'],
+                item['wing_delta'],
+                item['delta'],
+            ),
+        )
+        self.topik.qm = saved_qm.copy()
+        self.topik.fk()
+        return best['rtZ'], best['wing'], clamped, f"branch_{best['branch']}", candidates
 
     # ----- State handlers -----
 
@@ -501,17 +536,19 @@ class HybridController:
         print("="*60)
 
         try:
-            rtZ, wing, clamped = self._geometry_plan_arm(target, self.side)
+            rtZ, wing, clamped, branch_name, candidates = self._geometry_plan_arm(target, self.side)
+            self._selected_arm_branch = branch_name
 
             # Build q_cmd from the latest measured FK state.
             # FK Verify must use the same current stage offsets seen in
             # check_fk / topik.x, otherwise the "verify" pose is evaluated
             # at a different origin than the real robot.
-            required_q = self.topik.qm.copy()
+            required_q = self._measured_q.copy()
             required_q[2] = rtZ
             required_q[wi] = wing
 
             required_q = self.hw.apply_safety_limits(required_q)
+            target_cnt = self._q_math_to_cnt(required_q)
 
             # FK verification
             pin_reach = self.kin.fk_pin(required_q, self.side)
@@ -519,8 +556,17 @@ class HybridController:
 
             print(f"  Side         : {self.side}")
             print(f"  Target       : ({target[0]:.4f}, {target[1]:.4f}) m")
+            for cand in candidates:
+                print(f"  IK Candidate  : branch_{cand['branch']}  "
+                      f"rtZ={np.rad2deg(cand['rtZ']):.2f} deg, "
+                      f"wing={np.rad2deg(cand['wing']):.2f} deg, "
+                      f"res={cand['residual']*1000:.2f} mm, "
+                      f"d_rtZ={np.rad2deg(cand['q2_delta']):.2f} deg, "
+                      f"d_wing={np.rad2deg(cand['wing_delta']):.2f} deg")
+            print(f"  Branch       : {branch_name}")
             print(f"  rtZ (base)   : {np.rad2deg(required_q[2]):.2f} deg")
             print(f"  Wing [q{wi}]  : {np.rad2deg(required_q[wi]):.2f} deg")
+            print(f"  Target Cnt   : rtZ={target_cnt[2]}, wing={target_cnt[wi]}")
             print(f"  FK Verify    : ({pin_reach[0]:.4f}, {pin_reach[1]:.4f}) m")
             print(f"  Residual     : {residual*1000:.2f} mm")
             print(f"  Clamped      : {'YES' if clamped else 'NO'}")
@@ -726,6 +772,14 @@ class HybridController:
         for i in range(7):
             cnt[i] = int(np.round(q_hw[i] * self.topik.m2cnt[i]))
         return cnt
+
+    def _q_math_to_cnt(self, q_math: np.ndarray) -> list:
+        """Convert an arbitrary math-space q vector to hardware counts."""
+        q_hw = q_math.copy()
+        q_hw[2] = -q_hw[2]
+        q_hw[3] = -q_hw[3]
+        q_hw[4] = -q_hw[4]
+        return [int(np.round(q_hw[i] * self.topik.m2cnt[i])) for i in range(7)]
 
     @property
     def is_done(self) -> bool:
