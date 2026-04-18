@@ -8,22 +8,24 @@ import os
 import sys
 import json
 import random
+import argparse
 import numpy as np
 from PIL import Image
 
 import omni
+import omni.kit.app
 import omni.usd
 import omni.replicator.core as rep
 
-from pxr import UsdGeom, Gf, Semantics, UsdShade
+from pxr import UsdGeom, Gf, Semantics, UsdShade, Sdf
 
 
 # =========================
 # USER CONFIG
 # =========================
 USD_PATH    = r"C:/Users/JUN/Desktop/mydataset.usd"
-OUTPUT_DIR  = r"C:/Users/JUN/Documents/synthetic_dataset/output_paired"
-POSES_FILE  = os.path.join(OUTPUT_DIR, "poses.json")
+OUTPUT_DIR  = r"C:/Users/JUN/Documents/Pit-in/vision/output_paired"
+DISTILL_POSES_FILE = os.path.join(OUTPUT_DIR, "poses_distill.json")
 
 CAMERA_PRIM    = "/World/robot/lcam_1/lcam"
 PART_ROOT      = "/World/Niro_2"
@@ -61,11 +63,30 @@ ALL_BACK_PRIMS  = [h["prim"] for h in BACK_HOLES]
 CENTER_LABELS = {"kp_7", "kp_8", "kp_9"}
 
 RESOLUTION           = (640, 480)
-NUM_PART_POSES       = 1500      # Phase 1 frame count
-NUM_ROBOT_POSES      = 1500      # Phase 2 frame count
-NUM_BRIGHT_OCC_POSES = 3000      # bright_occ reuses part+robot pose sequence
-FRAMES_PER_RUN       = 3000
+BASELINE_LIGHT_COUNT = 10
+BASELINE_POSES_PER_LIGHT = 300
+BASELINE_PART_POSES = BASELINE_POSES_PER_LIGHT // 2
+BASELINE_ROBOT_POSES = BASELINE_POSES_PER_LIGHT - BASELINE_PART_POSES
+BASELINE_BLOOM_BLOCKS = (
+    (300, 900),
+    (1200, 1500),
+    (1800, 2100),
+    (2700, 3000),
+)
+DISTILL_POSES_PER_RUN = 500
+DISTILL_PART_POSES = DISTILL_POSES_PER_RUN // 2
+DISTILL_ROBOT_POSES = DISTILL_POSES_PER_RUN - DISTILL_PART_POSES
 RANDOM_SEED          = 7
+
+# Render synchronization tuning.
+# RGB pass can be expensive when bloom / linear lighting is enabled, so keep its
+# subframes moderate and make mask passes much cheaper.
+RGB_RT_SUBFRAMES     = 8
+MASK_RT_SUBFRAMES    = 1
+PRE_RENDER_UPDATES   = 2
+POST_RENDER_UPDATES  = 2
+FRAME_DRAIN_INTERVAL = 8
+FRAME_DRAIN_UPDATES  = 3
 
 # Vis thresholds (ratio = occluded_pixels / clean_pixels)
 VIS_FULL_THRESH     = 0.95   # >= 95% visible → vis=2
@@ -74,19 +95,6 @@ VIS_OCCLUDED_THRESH = 0.05   # <= 5%  visible → vis=0
 
 # Per-mode capture config: RGB filename + meta keys (for occluded modes)
 MODE_CONFIG = {
-    "clean": {
-        "image": "image_clean.png",
-    },
-    "aug": {
-        "image":           "image_aug.png",
-        "hole_pixels_key": "hole_pixels_aug",
-        "visibility_key":  "visibility",
-    },
-    "bright_occ": {
-        "image":           "image_bright_occ.png",
-        "hole_pixels_key": "hole_pixels_bright_occ",
-        "visibility_key":  "visibility_bright_occ",
-    },
     "baseline": {
         "image":           "image_baseline.png",
         "hole_pixels_key": "hole_pixels_baseline",
@@ -97,42 +105,55 @@ MODE_CONFIG = {
     "distill_clean": {
         "image": "image_clean.png",
     },
-    "distill_bright": {
-        "image":           "image_bright.png",
-        "hole_pixels_key": "hole_pixels_bright",
-        "visibility_key":  "visibility_bright",
+    "distill_occ": {
+        "image":           "image_occ.png",
+        "hole_pixels_key": "hole_pixels_occ",
+        "visibility_key":  "visibility_occ",
     },
-    "distill_dark": {
-        "image":           "image_dark.png",
-        "hole_pixels_key": "hole_pixels_dark",
-        "visibility_key":  "visibility_dark",
+    "distill_illum": {
+        "image":           "image_illum.png",
+        "hole_pixels_key": "hole_pixels_illum",
+        "visibility_key":  "visibility_illum",
     },
 }
 
 PART_POSE_RANGES = {
     "tx": (-0.2, 0.2),
     "ty": (-0.2, 0.2),
-    "tz": (0.4, 1.0),
-    "rz": (-40.0, 40.0),
+    "tz": (0.4, 1.1),
+    "rz": (-45.0, 45.0),
 }
 
 ROBOT_POSE_RANGES = {
     "tx": (-0.2, 0.2),
-    "ty": (-0.2, 0.2),
-    "tz": (0.1, 0.4),
-    "rz": (-40.0, 40.0),
+    "ty": (-0.1, 0.1),
+    "tz": (0.2, 0.4),
+    "rz": (-45.0, 45.0),
 }
 
-# ---- MODE & START OVERRIDE ----
-# Usage: python make_synthetic_dataset.py clean          (auto-detect start)
-#        python make_synthetic_dataset.py aug 1500       (force start from frame 1500)
-MODE = "clean"
-START_OVERRIDE = None
-for arg in sys.argv[1:]:
-    if arg in MODE_CONFIG:
-        MODE = arg
-    elif arg.isdigit():
-        START_OVERRIDE = int(arg)
+
+def _parse_args():
+    ap = argparse.ArgumentParser(description="Synthetic dataset capture")
+    ap.add_argument(
+        "mode",
+        nargs="?",
+        default="baseline",
+        choices=[
+            "baseline",
+            "distill_clean",
+            "distill_occ",
+            "distill_illum",
+        ],
+    )
+    ap.add_argument("-s", "--start", type=int, default=None, help="Start frame index for this run")
+    ap.add_argument("-p", "--frames", type=int, default=None, help="Number of frames to capture in this run")
+    return ap.parse_args()
+
+
+_ARGS = _parse_args()
+MODE = _ARGS.mode
+START_OVERRIDE = _ARGS.start
+FRAME_OVERRIDE = _ARGS.frames
 
 # Global: current robot pose to re-apply after physics updates.
 # Physics on the articulated robot overrides xformOps, so we restore it manually.
@@ -145,10 +166,24 @@ _active_robot_pose = None
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
+
+def _pose_file_for_mode(mode=None):
+    m = mode if mode is not None else MODE
+    return DISTILL_POSES_FILE
+
+def _frame_dir_name(frame_idx, mode=None):
+    m = mode if mode is not None else MODE
+    stem = f"{frame_idx:06d}"
+    if m == "baseline":
+        for start, end in BASELINE_BLOOM_BLOCKS:
+            if start <= frame_idx < end:
+                return f"{stem}_b"
+    return stem
+
 def get_frame_dir(frame_idx, mode=None):
     """Per-mode frame directory: OUTPUT_DIR/<mode>/<frame_idx>/"""
     m = mode if mode is not None else MODE
-    return os.path.join(OUTPUT_DIR, m, f"{frame_idx:06d}")
+    return os.path.join(OUTPUT_DIR, m, _frame_dir_name(frame_idx, mode))
 
 def get_stage():
     return omni.usd.get_context().get_stage()
@@ -165,6 +200,7 @@ def save_rgb_png(rgb, path):
     if rgb.ndim == 3 and rgb.shape[2] == 4:
         rgb = rgb[:, :, :3]
     Image.fromarray(rgb).save(path)
+
 
 def save_mask_png(mask, path):
     Image.fromarray(mask.astype(np.uint8)).save(path)
@@ -192,14 +228,21 @@ def get_annotator_data(anno):
         return data["data"], data.get("info", {})
     return data, {}
 
-def flush_and_render():
-    for _ in range(2):
+def _pump_app_updates(count):
+    app = omni.kit.app.get_app()
+    for _ in range(count):
         simulation_app.update()
+        app.update()
+
+def flush_and_render(mask_pass=False):
+    _pump_app_updates(PRE_RENDER_UPDATES)
     # Re-apply robot pose after physics updates
     if _active_robot_pose is not None:
         _set_robot_xform(_active_robot_pose)
-    rep.orchestrator.step(delta_time=0.0, rt_subframes=1,  wait_for_render=True)
-    rep.orchestrator.step(delta_time=0.0, rt_subframes=24, wait_for_render=True)
+    subframes = MASK_RT_SUBFRAMES if mask_pass else RGB_RT_SUBFRAMES
+    rep.orchestrator.step(delta_time=0.0, rt_subframes=1, wait_for_render=True)
+    rep.orchestrator.step(delta_time=0.0, rt_subframes=subframes, wait_for_render=True)
+    _pump_app_updates(POST_RENDER_UPDATES)
 
 def reapply_material(prim_path, material_path):
     prim = get_prim(prim_path)
@@ -234,27 +277,49 @@ def setup_semantics():
 
 
 # =========================
-# RANDOM POSE GENERATION & SAVE/LOAD
+# POSE BLOCK GENERATION
 # =========================
-def generate_random_part_poses(n, seed):
+def _generate_coverage_poses(n, ranges, seed):
     rng = random.Random(seed)
-    r = PART_POSE_RANGES
-    return [
-        (rng.uniform(*r["tx"]), rng.uniform(*r["ty"]), rng.uniform(*r["tz"]),
-         rng.uniform(*r["rz"]))
-        for _ in range(n)
-    ]
+    if n <= 0:
+        return []
+    tz_lo, tz_hi = ranges["tz"]
+    if n == 1:
+        tz_values = [(tz_lo + tz_hi) * 0.5]
+    else:
+        bin_edges = np.linspace(tz_lo, tz_hi, n + 1).tolist()
+        tz_values = [
+            rng.uniform(bin_edges[i], bin_edges[i + 1])
+            for i in range(n)
+        ]
+        rng.shuffle(tz_values)
 
-def generate_random_robot_poses(n, seed):
-    rng = random.Random(seed)
-    r = ROBOT_POSE_RANGES
-    return [
-        (rng.uniform(*r["tx"]), rng.uniform(*r["ty"]), rng.uniform(*r["tz"]),
-         rng.uniform(*r["rz"]))
-        for _ in range(n)
-    ]
+    poses = []
+    for tz in tz_values:
+        poses.append((
+            rng.uniform(*ranges["tx"]),
+            rng.uniform(*ranges["ty"]),
+            float(tz),
+            rng.uniform(*ranges["rz"]),
+        ))
+    return poses
 
-def save_poses(part_poses, robot_poses):
+def generate_baseline_pose_block(seed):
+    # Baseline uses a fresh pose block each run; no pose file is reused.
+    part_poses = _generate_coverage_poses(BASELINE_PART_POSES, PART_POSE_RANGES, seed)
+    robot_poses = _generate_coverage_poses(BASELINE_ROBOT_POSES, ROBOT_POSE_RANGES, seed + 1)
+    return part_poses, robot_poses
+
+
+def generate_distill_pose_block(seed):
+    # One pose block reused across distill_clean / distill_occ / distill_illum.
+    part_poses = _generate_coverage_poses(DISTILL_PART_POSES, PART_POSE_RANGES, seed)
+    robot_poses = _generate_coverage_poses(DISTILL_ROBOT_POSES, ROBOT_POSE_RANGES, seed + 1)
+    return part_poses, robot_poses
+
+
+def save_poses(part_poses, robot_poses, pose_file=None):
+    pose_file = pose_file or _pose_file_for_mode()
     data = {
         "seed":        RANDOM_SEED,
         "num_part":    len(part_poses),
@@ -262,29 +327,32 @@ def save_poses(part_poses, robot_poses):
         "part_poses":  [list(p) for p in part_poses],
         "robot_poses": [list(p) for p in robot_poses],
     }
-    with open(POSES_FILE, "w") as f:
+    with open(pose_file, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"[INFO] Poses saved to {POSES_FILE}")
+    print(f"[INFO] Poses saved to {pose_file}")
 
-def load_poses():
-    with open(POSES_FILE, "r") as f:
+def load_poses(pose_file=None):
+    pose_file = pose_file or _pose_file_for_mode()
+    with open(pose_file, "r") as f:
         data = json.load(f)
     part  = [tuple(p) for p in data["part_poses"]]
     robot = [tuple(p) for p in data["robot_poses"]]
-    print(f"[INFO] Poses loaded from {POSES_FILE} ({len(part)} part, {len(robot)} robot)")
+    print(f"[INFO] Poses loaded from {pose_file} ({len(part)} part, {len(robot)} robot)")
     return part, robot
 
 
 def _get_total_frames():
-    if MODE == "bright_occ":
-        return NUM_BRIGHT_OCC_POSES
-    return NUM_PART_POSES + NUM_ROBOT_POSES
+    # Baseline reuses one 300-pose block across 5 lighting conditions.
+    if MODE == "baseline":
+        return BASELINE_LIGHT_COUNT * BASELINE_POSES_PER_LIGHT
+    # Distill modes share one 500-pose block across clean / occ / illum.
+    if MODE.startswith("distill_"):
+        return DISTILL_POSES_PER_RUN
+    raise ValueError(f"Unsupported mode: {MODE}")
 
 def _get_clean_mode_for(mode):
     """occluded 모드가 참조할 clean 모드 결정"""
-    if mode.startswith("distill_"):
-        return "distill_clean"
-    return "clean"
+    return "distill_clean"
 
 def find_start_index():
     """Find the first frame index that is missing its capture image."""
@@ -373,6 +441,34 @@ def reset_robot_pose():
 # =========================
 # REPLICATOR SETUP
 # =========================
+def _ensure_api_schema(prim, schema_name):
+    existing = prim.GetMetadata("apiSchemas")
+    if isinstance(existing, Sdf.TokenListOp):
+        tokens = set(existing.prependedItems or [])
+        tokens.update(existing.appendedItems or [])
+        tokens.update(existing.explicitItems or [])
+        if schema_name in tokens:
+            return
+        tokens.add(schema_name)
+        prim.SetMetadata("apiSchemas", Sdf.TokenListOp.Create(tokens))
+        return
+    if existing:
+        tokens = list(existing)
+        if schema_name in tokens:
+            return
+        tokens.append(schema_name)
+        prim.SetMetadata("apiSchemas", Sdf.TokenListOp.Create(set(tokens)))
+        return
+    prim.SetMetadata("apiSchemas", Sdf.TokenListOp.Create({schema_name}))
+
+
+def _set_render_product_attr(prim, attr_name, type_name, value):
+    attr = prim.GetAttribute(attr_name)
+    if not attr.IsValid():
+        attr = prim.CreateAttribute(attr_name, type_name, custom=False)
+    attr.Set(value)
+
+
 def setup_replicator():
     rp  = rep.create.render_product(CAMERA_PRIM, RESOLUTION)
     rgb = rep.AnnotatorRegistry.get_annotator("rgb")
@@ -415,35 +511,154 @@ def _render_rgb(rgb_anno, out_path, robot_on):
     set_visibility(ROBOT_PRIM, robot_on)
     if robot_on:
         reapply_material(ROBOT_PRIM, ROBOT_MATERIAL)
-    flush_and_render()
+    flush_and_render(mask_pass=False)
     rgb_data, _ = get_annotator_data(rgb_anno)
     save_rgb_png(rgb_data, out_path)
+
 
 def _render_front_mask(sem_anno, robot_on):
     """Show front holes only (robot optionally ON for occlusion)."""
     set_holes_visibility(front=True, back=False)
     set_visibility(ROBOT_PRIM, robot_on)
-    flush_and_render()
+    flush_and_render(mask_pass=True)
     sem_map, info = get_annotator_data(sem_anno)
     return sem_map, info.get("idToLabels", {})
 
-def _render_back_mask(sem_anno):
-    """Show back holes only (robot OFF, amodal GT)."""
+def _render_back_mask(sem_anno, robot_on=False):
+    """Show back holes only (robot optionally ON for occlusion check)."""
     set_holes_visibility(front=False, back=True)
-    set_visibility(ROBOT_PRIM, False)
-    flush_and_render()
+    set_visibility(ROBOT_PRIM, robot_on)
+    flush_and_render(mask_pass=True)
     sem_map, info = get_annotator_data(sem_anno)
     return sem_map, info.get("idToLabels", {})
 
-def _classify_visibility(occluded_px, clean_px):
-    if clean_px == 0:
-        return 0
-    ratio = occluded_px / clean_px
-    if ratio <= VIS_OCCLUDED_THRESH:
-        return 0
-    if ratio >= VIS_FULL_THRESH:
-        return 2
-    return 1
+
+def _mask_bbox(mask):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+
+def _mask_touches_border(mask):
+    if mask.size == 0:
+        return False
+    return bool(
+        np.any(mask[0, :] > 0)
+        or np.any(mask[-1, :] > 0)
+        or np.any(mask[:, 0] > 0)
+        or np.any(mask[:, -1] > 0)
+    )
+
+
+def _build_target_metrics(
+    clean_sem_map,
+    clean_labels,
+    visible_sem_map,
+    visible_labels,
+    targets,
+):
+    metrics = {}
+    visibility = {}
+    visible_pixels = {}
+
+    for target in targets:
+        label = target["label"]
+        clean_mask = build_binary_mask_from_sem(clean_sem_map, clean_labels, label)
+        visible_mask = build_binary_mask_from_sem(visible_sem_map, visible_labels, label)
+
+        clean_px = int(np.sum(clean_mask > 0))
+        visible_px = int(np.sum(visible_mask > 0))
+        clean_touches_border = _mask_touches_border(clean_mask)
+        visible_ratio = (visible_px / clean_px) if clean_px > 0 else 0.0
+        is_truncated = clean_px == 0 or clean_touches_border
+        is_occluded = (not is_truncated) and (visible_ratio < VIS_FULL_THRESH)
+
+        if is_truncated:
+            vis_label = 0
+        elif visible_ratio < VIS_FULL_THRESH:
+            # Any meaningful occlusion should remain inferable target supervision.
+            vis_label = 1
+        else:
+            vis_label = 2
+
+        metrics[label] = {
+            "clean_pixels": clean_px,
+            "visible_pixels": visible_px,
+            "visible_ratio": visible_ratio,
+            "clean_bbox_xyxy": _mask_bbox(clean_mask),
+            "visible_bbox_xyxy": _mask_bbox(visible_mask),
+            "clean_touches_border": clean_touches_border,
+            "is_truncated": is_truncated,
+            "is_occluded": is_occluded,
+            "in_frame": not is_truncated,
+            "in_frame_ratio": 0.0 if is_truncated else 1.0,
+            "vis_label": vis_label,
+        }
+        visibility[label] = vis_label
+        visible_pixels[label] = visible_px
+
+    return metrics, visibility, visible_pixels
+
+
+def _serialize_clean_meta(frame_idx, front_metrics, back_metrics):
+    return {
+        "frame_idx": frame_idx,
+        "front_clean_pixels": {label: metrics["clean_pixels"] for label, metrics in front_metrics.items()},
+        "back_clean_pixels": {label: metrics["clean_pixels"] for label, metrics in back_metrics.items()},
+        "target_metrics_clean_front": front_metrics,
+        "target_metrics_clean_back": back_metrics,
+    }
+
+
+def _load_clean_target_metrics(frame_idx, mode):
+    clean_mode = _get_clean_mode_for(mode)
+    clean_meta_path = os.path.join(get_frame_dir(frame_idx, clean_mode), "meta.json")
+    with open(clean_meta_path, "r", encoding="utf-8") as f:
+        clean_meta = json.load(f)
+    return (
+        clean_meta.get("target_metrics_clean_front", {}),
+        clean_meta.get("target_metrics_clean_back", {}),
+    )
+
+
+def _build_metrics_from_clean(clean_metrics, visible_sem_map, visible_labels):
+    metrics = {}
+    visibility = {}
+    visible_pixels = {}
+
+    for label, clean_info in clean_metrics.items():
+        visible_mask = build_binary_mask_from_sem(visible_sem_map, visible_labels, label)
+        visible_px = int(np.sum(visible_mask > 0))
+        clean_px = int(clean_info.get("clean_pixels", 0))
+        visible_ratio = (visible_px / clean_px) if clean_px > 0 else 0.0
+        is_truncated = bool(clean_info.get("is_truncated", clean_px == 0))
+        is_occluded = (not is_truncated) and (visible_ratio < VIS_FULL_THRESH)
+
+        if is_truncated:
+            vis_label = 0
+        elif visible_ratio < VIS_FULL_THRESH:
+            vis_label = 1
+        else:
+            vis_label = 2
+
+        metrics[label] = {
+            "clean_pixels": clean_px,
+            "visible_pixels": visible_px,
+            "visible_ratio": visible_ratio,
+            "clean_bbox_xyxy": clean_info.get("clean_bbox_xyxy"),
+            "visible_bbox_xyxy": _mask_bbox(visible_mask),
+            "clean_touches_border": bool(clean_info.get("clean_touches_border", False)),
+            "is_truncated": is_truncated,
+            "is_occluded": is_occluded,
+            "in_frame": not is_truncated,
+            "in_frame_ratio": 0.0 if is_truncated else 1.0,
+            "vis_label": vis_label,
+        }
+        visibility[label] = vis_label
+        visible_pixels[label] = visible_px
+
+    return metrics, visibility, visible_pixels
 
 
 # =========================
@@ -451,12 +666,17 @@ def _classify_visibility(occluded_px, clean_px):
 # =========================
 def capture_clean(frame_idx, rgb_anno, sem_anno, mode_override=None):
     """Bright light, robot OFF → RGB + GT masks + per-hole pixel counts."""
-    mode = mode_override or "clean"
+    # distill_clean stores the canonical per-target clean meta used by later distill modes.
+    mode = mode_override or "distill_clean"
     frame_dir = get_frame_dir(frame_idx, mode)
     ensure_dir(frame_dir)
 
     # --- RGB (robot off) ---
-    _render_rgb(rgb_anno, os.path.join(frame_dir, MODE_CONFIG[mode]["image"]), robot_on=False)
+    _render_rgb(
+        rgb_anno,
+        os.path.join(frame_dir, MODE_CONFIG[mode]["image"]),
+        robot_on=False,
+    )
 
     # --- FRONT MASK (robot off → unoccluded); also record per-hole pixel counts ---
     sem_map, labels = _render_front_mask(sem_anno, robot_on=False)
@@ -492,65 +712,72 @@ def capture_clean(frame_idx, rgb_anno, sem_anno, mode_override=None):
     save_mask_png(mask_hole,   os.path.join(frame_dir, "mask_Hole.png"))
     save_mask_png(mask_center, os.path.join(frame_dir, "mask_CenterHole.png"))
 
-    # --- META: per-hole clean pixel counts (consumed by occluded-mode vis computation) ---
-    with open(os.path.join(frame_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "frame_idx":         frame_idx,
-            "hole_pixels_clean": hole_pixels,
-        }, f, indent=2, ensure_ascii=False)
+    front_metrics, _, _ = _build_target_metrics(
+        clean_sem_map=sem_map,
+        clean_labels=labels,
+        visible_sem_map=sem_map,
+        visible_labels=labels,
+        targets=FRONT_HOLES,
+    )
+    back_metrics, _, _ = _build_target_metrics(
+        clean_sem_map=sem_map2,
+        clean_labels=labels2,
+        visible_sem_map=sem_map2,
+        visible_labels=labels2,
+        targets=BACK_HOLES,
+    )
 
-    # Restore
+    with open(os.path.join(frame_dir, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(_serialize_clean_meta(frame_idx, front_metrics, back_metrics), f, indent=2, ensure_ascii=False)
+
     set_holes_visibility(front=True, back=True)
 
 
 # =========================
-# CAPTURE: OCCLUDED MODES (aug, bright_occ)
+# CAPTURE: DISTILL OCC / ILLUM
 # =========================
 def capture_occluded(frame_idx, mode, rgb_anno, sem_anno):
     """
     Robot ON → RGB + per-hole vis labels via comparison with clean pixel counts.
-    Shared between `aug` (dark light) and `bright_occ` (bright light).
+    Shared between distill_occ and distill_illum using the same clean target meta.
     Returns the per-label visibility dict.
     """
+    # Clean target metrics from distill_clean are the only visibility reference.
     cfg = MODE_CONFIG[mode]
     frame_dir = get_frame_dir(frame_idx, mode)
     ensure_dir(frame_dir)
 
     # --- RGB (robot on) ---
-    _render_rgb(rgb_anno, os.path.join(frame_dir, cfg["image"]), robot_on=True)
+    _render_rgb(
+        rgb_anno,
+        os.path.join(frame_dir, cfg["image"]),
+        robot_on=True,
+    )
 
-    # --- FRONT MASK with robot ON (partial occlusion) ---
-    sem_map, labels = _render_front_mask(sem_anno, robot_on=True)
+    sem_map_front, labels_front = _render_front_mask(sem_anno, robot_on=True)
+    sem_map_back, labels_back = _render_back_mask(sem_anno, robot_on=True)
+    clean_front_metrics, clean_back_metrics = _load_clean_target_metrics(frame_idx, mode)
+    front_metrics, front_visibility, front_pixels_visible = _build_metrics_from_clean(
+        clean_front_metrics, sem_map_front, labels_front
+    )
+    back_metrics, back_visibility, back_pixels_visible = _build_metrics_from_clean(
+        clean_back_metrics, sem_map_back, labels_back
+    )
 
-    # Load clean per-hole pixel counts (cross-mode read from clean folder)
-    clean_mode = _get_clean_mode_for(mode)
-    clean_meta_path = os.path.join(get_frame_dir(frame_idx, clean_mode), "meta.json")
-    with open(clean_meta_path, "r") as f:
-        clean_meta = json.load(f)
-    clean_pixels = clean_meta["hole_pixels_clean"]
-
-    hole_pixels_occ = {}
-    visibility      = {}
-
-    for h in FRONT_HOLES:
-        occ_mask = build_binary_mask_from_sem(sem_map, labels, h["label"])
-        occ_px   = int(np.sum(occ_mask > 0))
-        clean_px = clean_pixels.get(h["label"], 0)
-        hole_pixels_occ[h["label"]] = occ_px
-        visibility[h["label"]]      = _classify_visibility(occ_px, clean_px)
-
-    # Write meta in own mode folder
     meta = {
-        "frame_idx":            frame_idx,
-        cfg["hole_pixels_key"]: hole_pixels_occ,
-        cfg["visibility_key"]:  visibility,
+        "frame_idx": frame_idx,
+        cfg["hole_pixels_key"]: front_pixels_visible,
+        cfg["visibility_key"]: front_visibility,
+        f"{cfg['hole_pixels_key']}_back": back_pixels_visible,
+        f"{cfg['visibility_key']}_back": back_visibility,
+        f"target_metrics_{mode}_front": front_metrics,
+        f"target_metrics_{mode}_back": back_metrics,
     }
     with open(os.path.join(frame_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    # Restore
     set_holes_visibility(front=True, back=True)
-    return visibility
+    return front_visibility
 
 
 # =========================
@@ -563,6 +790,7 @@ def capture_baseline(frame_idx, rgb_anno, sem_anno):
       2) Robot ON  → RGB image + per-hole vis labels
     All outputs written into one frame directory + one meta.json.
     """
+    # Baseline writes front/back clean and robot-on target metrics in one folder.
     cfg = MODE_CONFIG["baseline"]
     frame_dir = get_frame_dir(frame_idx, "baseline")
     ensure_dir(frame_dir)
@@ -585,7 +813,7 @@ def capture_baseline(frame_idx, rgb_anno, sem_anno):
     save_mask_png(mask_hole_b,   os.path.join(frame_dir, "mask_Hole_B.png"))
     save_mask_png(mask_center_b, os.path.join(frame_dir, "mask_CenterHole_B.png"))
 
-    sem_map2, labels2 = _render_back_mask(sem_anno)
+    sem_map2, labels2 = _render_back_mask(sem_anno, robot_on=False)
 
     mask_hole   = np.zeros(sem_map2.shape[:2], dtype=np.uint8)
     mask_center = np.zeros(sem_map2.shape[:2], dtype=np.uint8)
@@ -601,28 +829,44 @@ def capture_baseline(frame_idx, rgb_anno, sem_anno):
     save_mask_png(mask_center, os.path.join(frame_dir, "mask_CenterHole.png"))
 
     # ---- Phase B: RGB with robot on + visibility ----
-    _render_rgb(rgb_anno, os.path.join(frame_dir, cfg["image"]), robot_on=True)
+    _render_rgb(
+        rgb_anno,
+        os.path.join(frame_dir, cfg["image"]),
+        robot_on=True,
+    )
     sem_map3, labels3 = _render_front_mask(sem_anno, robot_on=True)
+    sem_map4, labels4 = _render_back_mask(sem_anno, robot_on=True)
 
-    hole_pixels_occ = {}
-    visibility      = {}
-    for h in FRONT_HOLES:
-        occ_mask = build_binary_mask_from_sem(sem_map3, labels3, h["label"])
-        occ_px   = int(np.sum(occ_mask > 0))
-        clean_px = hole_pixels.get(h["label"], 0)
-        hole_pixels_occ[h["label"]] = occ_px
-        visibility[h["label"]]      = _classify_visibility(occ_px, clean_px)
+    front_metrics, front_visibility, hole_pixels_occ = _build_target_metrics(
+        clean_sem_map=sem_map,
+        clean_labels=labels,
+        visible_sem_map=sem_map3,
+        visible_labels=labels3,
+        targets=FRONT_HOLES,
+    )
+    back_metrics, back_visibility, back_pixels_occ = _build_target_metrics(
+        clean_sem_map=sem_map2,
+        clean_labels=labels2,
+        visible_sem_map=sem_map4,
+        visible_labels=labels4,
+        targets=BACK_HOLES,
+    )
 
     with open(os.path.join(frame_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump({
             "frame_idx":            frame_idx,
             "hole_pixels_clean":    hole_pixels,
             cfg["hole_pixels_key"]: hole_pixels_occ,
-            cfg["visibility_key"]:  visibility,
+            cfg["visibility_key"]:  front_visibility,
+            "back_pixels_clean":    {h["label"]: back_metrics[h["label"]]["clean_pixels"] for h in BACK_HOLES},
+            "back_pixels_baseline": back_pixels_occ,
+            "visibility_baseline_back": back_visibility,
+            "target_metrics_baseline_front": front_metrics,
+            "target_metrics_baseline_back": back_metrics,
         }, f, indent=2, ensure_ascii=False)
 
     set_holes_visibility(front=True, back=True)
-    return visibility
+    return front_visibility
 
 
 
@@ -663,17 +907,39 @@ def log_camera_intrinsics():
 # =========================
 def apply_pose_for_frame(frame_idx, part_poses, robot_poses):
     """
-    Two-phase sequence shared by all modes:
-      Phase 1 (frame_idx <  NUM_PART_POSES) : vary part pose, robot at identity
-      Phase 2 (frame_idx >= NUM_PART_POSES) : reset part, vary robot pose
-    Returns True if we are in Phase 2 for this frame.
+    Pose scheduling by mode.
+    - baseline: 300-frame light block, first half part motion and second half robot motion
+    - distill_*: 500-frame triplet block, first half part motion and second half robot motion
+    Returns True when the current frame is in the robot-motion half.
     """
-    if frame_idx < NUM_PART_POSES:
+    part_count = len(part_poses)
+    robot_count = len(robot_poses)
+
+    if MODE == "baseline":
+        local_idx = frame_idx % BASELINE_POSES_PER_LIGHT
+        if local_idx < part_count:
+            reset_robot_pose()
+            apply_part_pose(part_poses[local_idx])
+            return False
+        reset_part_pose()
+        apply_robot_pose(robot_poses[local_idx - part_count])
+        return True
+
+    if MODE.startswith("distill_"):
+        if frame_idx < part_count:
+            reset_robot_pose()
+            apply_part_pose(part_poses[frame_idx])
+            return False
+        reset_part_pose()
+        apply_robot_pose(robot_poses[frame_idx - part_count])
+        return True
+
+    if frame_idx < part_count:
         reset_robot_pose()
         apply_part_pose(part_poses[frame_idx])
         return False
     reset_part_pose()
-    apply_robot_pose(robot_poses[frame_idx - NUM_PART_POSES])
+    apply_robot_pose(robot_poses[frame_idx - part_count])
     return True
 
 
@@ -703,18 +969,23 @@ def main():
     rgb_anno, sem_anno = setup_replicator()
 
     # --- Pose generation / loading ---
-    POSE_GENERATORS = {"clean", "baseline", "distill_clean"}
-    if os.path.exists(POSES_FILE):
-        all_part_poses, all_robot_poses = load_poses()
+    # baseline: generate a fresh 300-pose block every run and do not save it
+    # distill_*: reuse poses_distill.json across clean / occ / illum
+    if MODE == "baseline":
+        seed = RANDOM_SEED + (START_OVERRIDE or 0)
+        all_part_poses, all_robot_poses = generate_baseline_pose_block(seed)
     else:
-        if MODE not in POSE_GENERATORS:
-            raise RuntimeError(
-                f"poses.json not found at {POSES_FILE}. "
-                f"Run clean, baseline, or distill_clean mode first to generate poses."
-            )
-        all_part_poses  = generate_random_part_poses(NUM_PART_POSES, RANDOM_SEED)
-        all_robot_poses = generate_random_robot_poses(NUM_ROBOT_POSES, RANDOM_SEED + 1)
-        save_poses(all_part_poses, all_robot_poses)
+        pose_file = _pose_file_for_mode(MODE)
+        if os.path.exists(pose_file):
+            all_part_poses, all_robot_poses = load_poses(pose_file)
+        else:
+            if MODE != "distill_clean":
+                raise RuntimeError(
+                    f"poses file not found at {pose_file}. "
+                    f"Run distill_clean first to generate the shared distill pose block."
+                )
+            all_part_poses, all_robot_poses = generate_distill_pose_block(RANDOM_SEED)
+            save_poses(all_part_poses, all_robot_poses, pose_file)
 
     # --- Auto-detect batch ---
     total_frames = _get_total_frames()
@@ -729,7 +1000,13 @@ def main():
         print(f"[INFO] All {total_frames} frames already captured for {MODE} mode. Nothing to do.")
         return
 
-    end_idx = min(start_idx + FRAMES_PER_RUN, total_frames)
+    default_run_frames = (
+        BASELINE_POSES_PER_LIGHT
+        if MODE == "baseline"
+        else DISTILL_POSES_PER_RUN
+    )
+    run_frames = FRAME_OVERRIDE if FRAME_OVERRIDE is not None else default_run_frames
+    end_idx = min(start_idx + run_frames, total_frames)
     print(f"[INFO] Resuming from frame {start_idx} → {end_idx - 1}  ({end_idx - start_idx} frames this run)")
 
     vis_stats = {0: 0, 1: 0, 2: 0}
@@ -741,14 +1018,24 @@ def main():
         is_phase2 = apply_pose_for_frame(frame_idx, all_part_poses, all_robot_poses)
 
         if not is_phase2 and frame_idx == start_idx:
-            print(f"[INFO] Phase 1: Part Pose (frames 0~{NUM_PART_POSES - 1})")
+            if MODE == "baseline":
+                print(
+                    f"[INFO] Baseline block pose coverage: "
+                    f"{BASELINE_LIGHT_COUNT} light blocks x {BASELINE_POSES_PER_LIGHT} frames "
+                    f"({BASELINE_PART_POSES} part + {BASELINE_ROBOT_POSES} robot per block)"
+                )
+            else:
+                print(
+                    f"[INFO] Distill triplet pose coverage: "
+                    f"{DISTILL_POSES_PER_RUN} frames "
+                    f"({DISTILL_PART_POSES} part + {DISTILL_ROBOT_POSES} robot)"
+                )
         if is_phase2 and not phase2_announced:
             phase2_announced = True
-            print(f"[INFO] Phase 2: Robot Pose (frames {NUM_PART_POSES}~{total_frames - 1})")
-
-        # bright_occ: keep robot visible during Phase 1 physics settle as well
-        if MODE == "bright_occ" and not is_phase2:
-            set_visibility(ROBOT_PRIM, True)
+            if MODE == "baseline":
+                print(f"[INFO] Baseline robot-pose half begins within each {BASELINE_POSES_PER_LIGHT}-frame light block")
+            else:
+                print(f"[INFO] Distill robot-pose half begins within the {DISTILL_POSES_PER_RUN}-frame triplet block")
 
         # Let physics settle, then force robot pose back (physics may override xformOps)
         for _ in range(24):
@@ -756,21 +1043,22 @@ def main():
         if _active_robot_pose is not None:
             _set_robot_xform(_active_robot_pose)
 
-        if MODE in ("clean", "distill_clean"):
+        if MODE == "distill_clean":
             capture_clean(frame_idx, rgb_anno, sem_anno,
-                          mode_override=MODE if MODE != "clean" else None)
+                          mode_override=MODE)
         elif MODE == "baseline":
             visibility = capture_baseline(frame_idx, rgb_anno, sem_anno)
             for v in visibility.values():
                 vis_stats[v] = vis_stats.get(v, 0) + 1
-        elif MODE in ("distill_bright", "distill_dark"):
+        elif MODE in ("distill_occ", "distill_illum"):
             visibility = capture_occluded(frame_idx, MODE, rgb_anno, sem_anno)
             for v in visibility.values():
                 vis_stats[v] = vis_stats.get(v, 0) + 1
         else:
-            visibility = capture_occluded(frame_idx, MODE, rgb_anno, sem_anno)
-            for v in visibility.values():
-                vis_stats[v] = vis_stats.get(v, 0) + 1
+            raise ValueError(f"Unsupported mode: {MODE}")
+
+        if ((frame_idx - start_idx + 1) % FRAME_DRAIN_INTERVAL) == 0:
+            _pump_app_updates(FRAME_DRAIN_UPDATES)
 
         print(f"[{MODE}] {frame_idx + 1}/{total_frames}")
 
@@ -779,11 +1067,10 @@ def main():
     remaining = total_frames - end_idx
 
     NEXT_MODE = {
-        "clean":          "aug",
-        "distill_clean":  "distill_bright  (씬 조명 유지, 로봇 ON)",
-        "distill_bright": "distill_dark    (씬 조명 어둡게 변경 후)",
+        "distill_clean": "distill_occ",
+        "distill_occ": "distill_illum",
     }
-    if MODE in ("clean", "distill_clean"):
+    if MODE == "distill_clean":
         if find_start_index() >= total_frames:
             print(f"[INFO] All {MODE} frames done!")
             if MODE in NEXT_MODE:

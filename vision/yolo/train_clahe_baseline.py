@@ -17,11 +17,14 @@ import numpy as np
 import yaml
 from ultralytics import YOLO
 
+from online_lighting_aug import LightingAugPoseTrainer
+
 
 DEFAULT_DATA_ROOT = Path("vision/dataset/yolo_pose_baseline_dataset")
 DEFAULT_BASE_WEIGHTS = Path("vision/yolo/weights/yolo26n-pose.pt")
 DEFAULT_RUNS_DIR = Path("vision/yolo/runs/clahe_baseline")
 DEFAULT_RESULT_DIR = Path("vision/result/clahe_baseline")
+DEFAULT_EPOCHS = 80
 DEFAULT_EVAL_DATA_ROOTS = [
     Path("vision/dataset/yolo_pose_baseline_dataset"),
     Path("vision/dataset/yolo_pose_distill_dataset"),
@@ -40,6 +43,17 @@ def apply_clahe(img: np.ndarray, clip: float = CLAHE_CLIP, grid: int = CLAHE_GRI
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
+def _resolve_split_dirs(dataset_root: Path, split: str) -> tuple[Path, Path]:
+    candidates = [
+        (dataset_root / "images" / split, dataset_root / "labels" / split),
+        (dataset_root / split / "images", dataset_root / split / "labels"),
+    ]
+    for img_dir, lbl_dir in candidates:
+        if img_dir.exists():
+            return img_dir, lbl_dir
+    raise FileNotFoundError(f"Could not resolve split={split} under {dataset_root}")
+
+
 def prepare_clahe_dataset(src_root: Path, dst_root: Path, clip: float, grid: int) -> Path:
     """Copy dataset with CLAHE-processed images. Labels are copied as-is."""
     if dst_root.exists():
@@ -50,13 +64,9 @@ def prepare_clahe_dataset(src_root: Path, dst_root: Path, clip: float, grid: int
     dst_root.mkdir(parents=True, exist_ok=True)
 
     for split in ["train", "val", "test"]:
-        src_img_dir = src_root / split / "images"
-        src_lbl_dir = src_root / split / "labels"
-        dst_img_dir = dst_root / split / "images"
-        dst_lbl_dir = dst_root / split / "labels"
-
-        if not src_img_dir.exists():
-            continue
+        src_img_dir, src_lbl_dir = _resolve_split_dirs(src_root, split)
+        dst_img_dir = dst_root / "images" / split
+        dst_lbl_dir = dst_root / "labels" / split
 
         dst_img_dir.mkdir(parents=True, exist_ok=True)
         dst_lbl_dir.mkdir(parents=True, exist_ok=True)
@@ -96,9 +106,9 @@ def write_corrected_data_yaml(dataset_root: Path, out_path: Path) -> Path:
             data = yaml.safe_load(f) or {}
 
     data["path"] = str(dataset_root.resolve())
-    data.setdefault("train", "train/images")
-    data.setdefault("val", "val/images")
-    data.setdefault("test", "test/images")
+    data.setdefault("train", "images/train")
+    data.setdefault("val", "images/val")
+    data.setdefault("test", "images/test")
     data.setdefault("kpt_shape", [9, 3])
     data.setdefault(
         "names",
@@ -188,7 +198,7 @@ def main() -> None:
                     help="Temp dir for training artifacts (CLAHE cache, Ultralytics logs)")
     ap.add_argument("--result-dir", type=Path, default=DEFAULT_RESULT_DIR,
                     help="Final output dir (weights, eval, meta)")
-    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--device", type=str, default="0")
@@ -196,6 +206,11 @@ def main() -> None:
     ap.add_argument("--clahe-clip", type=float, default=CLAHE_CLIP)
     ap.add_argument("--clahe-grid", type=int, default=CLAHE_GRID)
     ap.add_argument("--eval-data-roots", type=Path, nargs="*", default=DEFAULT_EVAL_DATA_ROOTS)
+    ap.add_argument("--online-aug", action="store_true", default=True)
+    ap.add_argument("--no-online-aug", action="store_false", dest="online_aug")
+    ap.add_argument("--lowlight-p", type=float, default=0.45)
+    ap.add_argument("--backlight-p", type=float, default=0.28)
+    ap.add_argument("--backlight-p-b", type=float, default=0.08)
     args = ap.parse_args()
 
     if not args.data_root.exists():
@@ -251,6 +266,11 @@ def main() -> None:
         project=str(runs_dir.resolve()),
         name="train",
         exist_ok=True,
+        trainer=LightingAugPoseTrainer,
+        online_aug=args.online_aug,
+        lowlight_p=args.lowlight_p,
+        backlight_p=args.backlight_p,
+        backlight_p_b=args.backlight_p_b,
     )
 
     best_ckpt = Path(results.save_dir) / "weights" / "best.pt"

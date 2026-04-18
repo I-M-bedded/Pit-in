@@ -45,14 +45,15 @@ from coin_pose import (
     COINLoss,
     TotalVariationLoss,
     IlluminationAugmentor,
+    infer_checkpoint_channels,
+    infer_coin_feature_spec,
+    normalize_coin_variant,
 )
 
 # ================================================================
 # Constants
 # ================================================================
 
-TARGET_LAYERS = [4, 6, 10]
-CHANNELS = [128, 128, 256]
 NUM_EXPERTS = 3
 ILL_CH = 64
 WORKERS = 4
@@ -292,6 +293,9 @@ def train_phase1(
     data_root: str,
     base_weights: str,
     out_dir: str,
+    coin_variant: str = "full",
+    feature_source: str = "backbone",
+    feature_layers=None,
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 1e-3,
@@ -308,7 +312,13 @@ def train_phase1(
 
     # Load YOLO and wrap with COIN-Pose
     yolo = YOLO(base_weights)
-    model = COINPose(yolo, num_experts=NUM_EXPERTS)
+    model = COINPose(
+        yolo,
+        num_experts=NUM_EXPERTS,
+        coin_variant=coin_variant,
+        feature_source=feature_source,
+        feature_layers=feature_layers,
+    )
     model.set_phase(1)  # freezes YOLO backbone
     model.to(device)
     model.train()
@@ -359,6 +369,7 @@ def train_phase1(
         "imgsz": imgsz,
         "warmup_epochs": warmup_epochs,
         "workers": WORKERS,
+        "coin_meta": model.export_meta(),
         "max_train_pairs": max_train_pairs,
         "max_val_pairs": max_val_pairs,
         "n_train_pairs": len(ds_train),
@@ -433,12 +444,14 @@ def train_phase1(
 
             # Get visibility stats scale-by-scale since resolutions differ
             vis_maps = outputs["visibility_maps"] # List of (B, 1, h, w)
-            vis_means = [v.mean().item() for v in vis_maps]
-            restore_ratios = [(v < 0.5).float().mean().item() for v in vis_maps]
-            
-            # Global averages for summary
-            vis_mean = sum(vis_means) / len(vis_means)
-            restore_preference = sum(restore_ratios) / len(restore_ratios)
+            if vis_maps:
+                vis_means = [v.mean().item() for v in vis_maps]
+                restore_ratios = [(v < 0.5).float().mean().item() for v in vis_maps]
+                vis_mean = sum(vis_means) / len(vis_means)
+                restore_preference = sum(restore_ratios) / len(restore_ratios)
+            else:
+                vis_mean = 1.0
+                restore_preference = 0.0
 
         print(f"  [E{epoch:02d} monitor] Expert Usage: {[f'{x:.3f}' for x in expert_usage_list]} | Entropy: {expert_entropy:.4f}")
         print(f"  [E{epoch:02d} monitor] Vis Mean: {vis_mean:.4f} | Restore Preference (vis<0.5): {restore_preference*100:.1f}%")
@@ -468,12 +481,15 @@ def train_phase1(
             "epoch": epoch,
             "train_loss": train_loss,
             "val_core": val_core,
+            "meta": model.export_meta(),
             "illumination_encoder": model.illumination_encoder.state_dict(),
             "soft_router": model.soft_router.state_dict(),
             "multi_scale_rsv": model.multi_scale_rsv.state_dict(),
-            "context_pyramid": model.context_pyramid.state_dict(),
-            "occlusion_recovery": model.occlusion_recovery.state_dict(),
         }
+        if model.context_pyramid is not None:
+            ckpt["context_pyramid"] = model.context_pyramid.state_dict()
+        if model.occlusion_recovery is not None:
+            ckpt["occlusion_recovery"] = model.occlusion_recovery.state_dict()
         torch.save(ckpt, str(out / "last.pt"))
         if val_core < best_val_loss:
             best_val_loss = val_core
@@ -492,18 +508,119 @@ def train_phase1(
 
 def save_coin_modules(detection_model: nn.Module, path: str):
     """Save COIN module weights from a patched PoseModel."""
-    torch.save({
+    meta = {
+        "coin_variant": normalize_coin_variant(
+            getattr(detection_model, "_coin_variant", getattr(detection_model, "coin_variant", "full"))
+        ),
+        "feature_source": getattr(
+            detection_model, "_coin_feature_source", getattr(detection_model, "feature_source", "backbone")
+        ),
+        "target_layers": list(
+            getattr(detection_model, "_coin_target_layers", getattr(detection_model, "target_layers", []))
+        ),
+        "channels": list(
+            getattr(detection_model, "_coin_channels", getattr(detection_model, "channels_list", []))
+        ),
+        "resolutions": list(
+            getattr(
+                detection_model,
+                "_coin_resolutions",
+                getattr(getattr(detection_model, "feature_spec", {}), "get", lambda *_: [])("resolutions", []),
+            )
+        ),
+    }
+    payload = {
+        "meta": meta,
         "illumination_encoder": detection_model.coin_ie.state_dict(),
         "soft_router": detection_model.coin_sr.state_dict(),
         "multi_scale_rsv": detection_model.coin_rsv.state_dict(),
-        "context_pyramid": detection_model.coin_ctx.state_dict(),
-        "occlusion_recovery": detection_model.coin_or.state_dict(),
-    }, path)
+    }
+    if getattr(detection_model, "coin_ctx", None) is not None:
+        payload["context_pyramid"] = detection_model.coin_ctx.state_dict()
+    if getattr(detection_model, "coin_or", None) is not None:
+        payload["occlusion_recovery"] = detection_model.coin_or.state_dict()
+    torch.save(payload, path)
 
 
-def patch_yolo_with_coin(
+def _unwrap_module(module: Optional[nn.Module]) -> Optional[nn.Module]:
+    if module is None:
+        return None
+    return module.module if hasattr(module, "module") else module
+
+
+def _resolve_coin_host(module: Optional[nn.Module]) -> Optional[nn.Module]:
+    module = _unwrap_module(module)
+    if module is None:
+        return None
+    required = ("coin_ie", "coin_sr", "coin_rsv")
+    if all(hasattr(module, name) for name in required):
+        return module
+    inner = getattr(module, "model", None)
+    inner = _unwrap_module(inner)
+    if inner is not None and all(hasattr(inner, name) for name in required):
+        return inner
+    return None
+
+
+def _save_coin_modules_from_trainer(trainer, path: str, prefer_ema: bool = False) -> bool:
+    candidates = []
+    ema_obj = getattr(getattr(trainer, "ema", None), "ema", None)
+    model_obj = getattr(trainer, "model", None)
+    if prefer_ema:
+        candidates.extend([ema_obj, model_obj])
+    else:
+        candidates.extend([model_obj, ema_obj])
+    for candidate in candidates:
+        host = _resolve_coin_host(candidate)
+        if host is not None:
+            save_coin_modules(host, path)
+            return True
+    return False
+
+
+def _load_state_flexible(module: nn.Module, state_dict: dict, module_name: str):
+    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        print(
+            f"[patch] {module_name}: missing={len(missing)} unexpected={len(unexpected)} "
+            f"(checkpoint format drift tolerated)"
+        )
+
+
+def _choose_feature_spec_for_load(
+    det: nn.Module,
+    state: dict,
+    feature_source: str,
+    feature_layers,
+) -> Dict[str, List[int]]:
+    meta = state.get("meta", {}) if isinstance(state, dict) else {}
+    if feature_layers is None and meta.get("target_layers"):
+        return infer_coin_feature_spec(
+            det.model,
+            feature_source=str(meta.get("feature_source", feature_source)),
+            feature_layers=meta.get("target_layers"),
+        )
+
+    if feature_layers is None:
+        ckpt_channels = infer_checkpoint_channels(state)
+        if ckpt_channels:
+            candidates = [
+                infer_coin_feature_spec(det.model, feature_source="backbone"),
+                infer_coin_feature_spec(det.model, feature_source="head"),
+            ]
+            for candidate in candidates:
+                if candidate["channels"] == ckpt_channels:
+                    return candidate
+
+    return infer_coin_feature_spec(det.model, feature_source=feature_source, feature_layers=feature_layers)
+
+
+def _patch_yolo_with_coin_legacy(
     yolo_model,
     coin_ckpt: Optional[str] = None,
+    coin_variant: Optional[str] = None,
+    feature_source: Optional[str] = None,
+    feature_layers=None,
     anchor_weight: float = 0.01,
     aux_tv_weight: float = 0.05,
 ):
@@ -526,13 +643,13 @@ def patch_yolo_with_coin(
 
     if coin_ckpt:
         state = torch.load(coin_ckpt, map_location="cpu")
-        ie.load_state_dict(state["illumination_encoder"])
-        sr.load_state_dict(state["soft_router"])
-        rsv.load_state_dict(state["multi_scale_rsv"])
+        _load_state_flexible(ie, state["illumination_encoder"], "illumination_encoder")
+        _load_state_flexible(sr, state["soft_router"], "soft_router")
+        _load_state_flexible(rsv, state["multi_scale_rsv"], "multi_scale_rsv")
         if "context_pyramid" in state:
-            ctx.load_state_dict(state["context_pyramid"])
+            _load_state_flexible(ctx, state["context_pyramid"], "context_pyramid")
         if "occlusion_recovery" in state:
-            occlu_recovery.load_state_dict(state["occlusion_recovery"])
+            _load_state_flexible(occlu_recovery, state["occlusion_recovery"], "occlusion_recovery")
         print(f"[patch] loaded COIN modules from {coin_ckpt}")
 
     # Register as sub-modules (so parameters are discoverable)
@@ -652,6 +769,181 @@ def patch_yolo_with_coin(
     return yolo_model
 
 
+def patch_yolo_with_coin(
+    yolo_model,
+    coin_ckpt: Optional[str] = None,
+    coin_variant: Optional[str] = None,
+    feature_source: Optional[str] = None,
+    feature_layers=None,
+    anchor_weight: float = 0.01,
+    aux_tv_weight: float = 0.05,
+):
+    """
+    Add COIN modules to YOLO PoseModel and override _predict_once.
+    Modules become part of model.parameters() so the optimizer picks them up.
+
+    Also overrides the loss method to inject COIN auxiliary losses:
+      - L2 anchor regularization toward Phase 1 weights
+      - TV smoothness on FiLM modulation
+    """
+    det = yolo_model.model  # PoseModel
+    state = None
+    ckpt_meta = {}
+    if coin_ckpt:
+        state = torch.load(coin_ckpt, map_location="cpu")
+        ckpt_meta = state.get("meta", {}) if isinstance(state, dict) else {}
+
+    resolved_variant = normalize_coin_variant(coin_variant or ckpt_meta.get("coin_variant"))
+    resolved_feature_source = str(feature_source or ckpt_meta.get("feature_source", "backbone"))
+    feature_spec = (
+        _choose_feature_spec_for_load(det, state, resolved_feature_source, feature_layers)
+        if state is not None
+        else infer_coin_feature_spec(det.model, feature_source=resolved_feature_source, feature_layers=feature_layers)
+    )
+    target_layers = list(feature_spec["target_layers"])
+    channels = list(feature_spec["channels"])
+
+    ie = SpatiallyVariantIlluminationEncoder(3, ILL_CH)
+    sr = SpatiallyAwareSoftRouter(ILL_CH, NUM_EXPERTS)
+    rsv = MultiScaleRSVFiLM(channels, ILL_CH, NUM_EXPERTS)
+    ctx = COINContextPyramid(channels, context_channels=128) if resolved_variant == "full" else None
+    occlu_recovery = OcclusionContextRecovery(channels) if resolved_variant == "full" else None
+
+    if state is not None:
+        _load_state_flexible(ie, state["illumination_encoder"], "illumination_encoder")
+        _load_state_flexible(sr, state["soft_router"], "soft_router")
+        _load_state_flexible(rsv, state["multi_scale_rsv"], "multi_scale_rsv")
+        if ctx is not None and "context_pyramid" in state:
+            _load_state_flexible(ctx, state["context_pyramid"], "context_pyramid")
+        if occlu_recovery is not None and "occlusion_recovery" in state:
+            _load_state_flexible(occlu_recovery, state["occlusion_recovery"], "occlusion_recovery")
+        print(f"[patch] loaded COIN modules from {coin_ckpt}")
+
+    det.add_module("coin_ie", ie)
+    det.add_module("coin_sr", sr)
+    det.add_module("coin_rsv", rsv)
+    if ctx is not None:
+        det.add_module("coin_ctx", ctx)
+    else:
+        det.coin_ctx = None
+    if occlu_recovery is not None:
+        det.add_module("coin_or", occlu_recovery)
+    else:
+        det.coin_or = None
+    det._coin_variant = resolved_variant
+    det._coin_target_layers = list(target_layers)
+    det._coin_channels = list(channels)
+    det._coin_feature_source = str(feature_spec["feature_source"])
+    det._coin_resolutions = list(feature_spec.get("resolutions", []))
+
+    anchor_params = []
+    coin_params_ref = []
+    for name in ["coin_ie", "coin_sr", "coin_rsv", "coin_ctx", "coin_or"]:
+        module = getattr(det, name, None)
+        if module is None:
+            continue
+        for p in module.parameters():
+            anchor_params.append(p.data.clone())
+            coin_params_ref.append(p)
+    det._coin_anchor_params = anchor_params
+    det._coin_params_ref = coin_params_ref
+    det._coin_cache = None
+
+    def _modulated_predict_once(self, x, profile=False, visualize=False, embed=None):
+        x_input = x
+        Z = self.coin_ie(x_input)
+        P = self.coin_sr(Z)
+
+        y, dt = [], []
+        target_cache = {}
+        delta_gammas, delta_betas = [], []
+
+        for m in self.model:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+
+            if m.i in self._coin_target_layers:
+                target_cache[m.i] = x
+                if m.i == self._coin_target_layers[-1]:
+                    feats = [target_cache[idx] for idx in self._coin_target_layers]
+                    modulated = []
+                    for idx, feat in enumerate(feats):
+                        feat_m, dg, db, _ = self.coin_rsv.forward_single(feat, idx, Z, P)
+                        modulated.append(feat_m)
+                        delta_gammas.append(dg)
+                        delta_betas.append(db)
+
+                    if self._coin_variant == "full":
+                        shared = self.coin_ctx(modulated)
+                        refined = []
+                        for idx, (feat_m, feat_ctx) in enumerate(zip(modulated, shared)):
+                            feat_out, _, _ = self.coin_or.forward_single(
+                                feat=feat_m,
+                                context_feat=feat_ctx,
+                                scale_idx=idx,
+                                reconstruct=True,
+                            )
+                            refined.append(feat_out)
+                    else:
+                        refined = modulated
+
+                    for layer_idx, feat_new in zip(self._coin_target_layers, refined):
+                        target_cache[layer_idx] = feat_new
+                        if layer_idx < len(y):
+                            y[layer_idx] = feat_new
+                    x = target_cache[m.i]
+
+            y.append(x if m.i in self.save else None)
+
+        self._coin_cache = {
+            "delta_gammas": delta_gammas,
+            "delta_betas": delta_betas,
+        }
+        return x
+
+    det._predict_once = types.MethodType(_modulated_predict_once, det)
+    print(
+        "[patch] YOLO _predict_once overridden with COIN modulation "
+        f"(variant={resolved_variant}, source={det._coin_feature_source}, "
+        f"layers={det._coin_target_layers}, channels={det._coin_channels})"
+    )
+
+    _OrigLossMethod = type(det).loss
+    _tv = TotalVariationLoss()
+    _anchor_w = anchor_weight
+    _aux_tv_w = aux_tv_weight
+
+    def _augmented_loss(self, batch, preds=None):
+        loss, loss_items = _OrigLossMethod(self, batch, preds)
+
+        if not self.training:
+            return loss, loss_items
+
+        if hasattr(self, "_coin_anchor_params") and self._coin_anchor_params:
+            anchor_loss = sum(
+                F.mse_loss(p, a)
+                for p, a in zip(self._coin_params_ref, self._coin_anchor_params)
+            ) / len(self._coin_anchor_params)
+            loss = loss + _anchor_w * anchor_loss
+
+        if hasattr(self, "_coin_cache") and self._coin_cache is not None:
+            cache = self._coin_cache
+            dgs = cache.get("delta_gammas", [])
+            dbs = cache.get("delta_betas", [])
+            if dgs and dbs:
+                tv_val = sum(_tv(dg) + _tv(db) for dg, db in zip(dgs, dbs)) / max(len(dgs), 1)
+                loss = loss + _aux_tv_w * tv_val
+            self._coin_cache = None
+
+        return loss, loss_items
+
+    det.loss = types.MethodType(_augmented_loss, det)
+    print(f"[patch] loss method augmented (anchor_w={_anchor_w}, tv_w={_aux_tv_w})")
+
+    return yolo_model
+
+
 # ================================================================
 # Phase 2: ultralytics fine-tuning with patched model
 # ================================================================
@@ -725,27 +1017,30 @@ def evaluate_coin_on_datasets(
 
 class COINSaveCallback:
     """Save COIN module weights alongside ultralytics checkpoints."""
-    def __init__(self, detection_model: nn.Module, save_dir: str):
-        self.det = detection_model
+    def __init__(self, save_dir: str):
         self.save_dir = Path(save_dir)
 
     def __call__(self, trainer):
-        save_coin_modules(self.det, str(self.save_dir / "coin_modules_last.pt"))
+        _save_coin_modules_from_trainer(trainer, str(self.save_dir / "coin_modules_last.pt"), prefer_ema=False)
         if trainer.best_fitness == trainer.fitness:
-            save_coin_modules(self.det, str(self.save_dir / "coin_modules_best.pt"))
+            saved = _save_coin_modules_from_trainer(
+                trainer, str(self.save_dir / "coin_modules_best.pt"), prefer_ema=True
+            )
+            if not saved:
+                print("[warn] COIN best checkpoint not saved: COIN host not found on trainer")
 
 
 class EMATeacherCallback:
     """EMA update of anchor weights for COIN modules [Issue #8]."""
-    def __init__(self, detection_model: nn.Module, momentum: float = 0.999):
-        self.det = detection_model
+    def __init__(self, momentum: float = 0.999):
         self.momentum = momentum
 
     def __call__(self, trainer):
-        if not hasattr(self.det, "_coin_anchor_params"):
+        det = _resolve_coin_host(getattr(trainer, "model", None))
+        if det is None or not hasattr(det, "_coin_anchor_params"):
             return
         mu = self.momentum
-        for anchor, param in zip(self.det._coin_anchor_params, self.det._coin_params_ref):
+        for anchor, param in zip(det._coin_anchor_params, det._coin_params_ref):
             anchor.data.mul_(mu).add_(param.data, alpha=1.0 - mu)
 
 
@@ -754,6 +1049,9 @@ def train_phase2(
     base_weights: str,
     p1_ckpt: str,
     out_dir: str,
+    coin_variant: str = "full",
+    feature_source: str = "backbone",
+    feature_layers=None,
     epochs: int = 80,
     warmup_epochs: int = 5,
     batch_size: int = 8,
@@ -795,6 +1093,9 @@ def train_phase2(
         "device": device_str,
         "workers": WORKERS,
         "patience": patience,
+        "coin_variant": normalize_coin_variant(coin_variant),
+        "feature_source": feature_source,
+        "feature_layers": feature_layers,
         "anchor_weight": anchor_weight,
         "aux_tv_weight": aux_tv_weight,
     }
@@ -809,10 +1110,17 @@ def train_phase2(
         print(f"{'='*72}")
 
         model_2a = YOLO(base_weights)
-        patch_yolo_with_coin(model_2a, coin_ckpt=p1_ckpt,
-                             anchor_weight=anchor_weight, aux_tv_weight=aux_tv_weight)
+        patch_yolo_with_coin(
+            model_2a,
+            coin_ckpt=p1_ckpt,
+            coin_variant=coin_variant,
+            feature_source=feature_source,
+            feature_layers=feature_layers,
+            anchor_weight=anchor_weight,
+            aux_tv_weight=aux_tv_weight,
+        )
 
-        coin_saver_2a = COINSaveCallback(model_2a.model, str(out))
+        coin_saver_2a = COINSaveCallback(str(out))
         model_2a.add_callback("on_fit_epoch_end", coin_saver_2a)
 
         model_2a.train(
@@ -856,11 +1164,18 @@ def train_phase2(
     print(f"{'='*72}")
 
     model = YOLO(str(warmup_yolo))
-    patch_yolo_with_coin(model, coin_ckpt=str(warmup_coin),
-                         anchor_weight=anchor_weight, aux_tv_weight=aux_tv_weight)
+    patch_yolo_with_coin(
+        model,
+        coin_ckpt=str(warmup_coin),
+        coin_variant=coin_variant,
+        feature_source=feature_source,
+        feature_layers=feature_layers,
+        anchor_weight=anchor_weight,
+        aux_tv_weight=aux_tv_weight,
+    )
 
-    coin_saver = COINSaveCallback(model.model, str(out))
-    ema_updater = EMATeacherCallback(model.model, momentum=0.999)
+    coin_saver = COINSaveCallback(str(out))
+    ema_updater = EMATeacherCallback(momentum=0.999)
     model.add_callback("on_fit_epoch_end", coin_saver)
     model.add_callback("on_train_batch_end", ema_updater)
 
@@ -939,6 +1254,14 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--device", type=str, default="0")
     ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--coin-variant", type=str, default="full",
+                    choices=["film", "full"],
+                    help="COIN-FiLM only or full COIN with occlusion side branch")
+    ap.add_argument("--coin-feature-source", type=str, default="backbone",
+                    choices=["backbone", "head"],
+                    help="Which pyramid family to tap for COIN feature modulation")
+    ap.add_argument("--coin-feature-layers", type=str, default=None,
+                    help="Optional comma-separated layer indices overriding automatic tap inference")
     ap.add_argument("--anchor-weight", type=float, default=0.01,
                     help="L2 anchor regularization weight for Phase 2")
     ap.add_argument("--aux-tv-weight", type=float, default=0.05,
@@ -965,6 +1288,9 @@ def main():
             data_root=args.phase1_data_root,
             base_weights=args.base_weights,
             out_dir=runs_dir,
+            coin_variant=args.coin_variant,
+            feature_source=args.coin_feature_source,
+            feature_layers=args.coin_feature_layers,
             epochs=args.epochs_p1,
             batch_size=args.batch_p1,
             lr=args.lr_p1,
@@ -982,6 +1308,9 @@ def main():
             base_weights=args.base_weights,
             p1_ckpt=p1_ckpt,
             out_dir=runs_dir,
+            coin_variant=args.coin_variant,
+            feature_source=args.coin_feature_source,
+            feature_layers=args.coin_feature_layers,
             epochs=args.epochs_p2,
             warmup_epochs=args.warmup_p2,
             batch_size=args.batch_p2,

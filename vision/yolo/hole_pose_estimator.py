@@ -27,8 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -194,6 +195,289 @@ def fit_boundary_ellipse(kpts_xy: np.ndarray, kpts_conf: np.ndarray, kp_conf: fl
         "angle_deg": angle_deg,
         "num_points": int(len(points)),
     }
+
+
+def ellipse_to_conic_matrix(ellipse: dict) -> np.ndarray:
+    """Convert ellipse params (from fit_boundary_ellipse) to 3x3 conic matrix.
+
+    The conic C satisfies  [x y 1] C [x y 1]^T = 0  for points on the ellipse.
+    """
+    cx, cy = ellipse["center_xy"]
+    w, h = ellipse["axes_px"]
+    a, b = w / 2.0, h / 2.0
+    theta = np.deg2rad(ellipse["angle_deg"])
+    ct, st = np.cos(theta), np.sin(theta)
+
+    M = np.array([
+        [ct ** 2 / a ** 2 + st ** 2 / b ** 2, ct * st * (1 / a ** 2 - 1 / b ** 2)],
+        [ct * st * (1 / a ** 2 - 1 / b ** 2), st ** 2 / a ** 2 + ct ** 2 / b ** 2],
+    ])
+    c = np.array([cx, cy])
+    Mc = M @ c
+
+    C = np.zeros((3, 3))
+    C[:2, :2] = M
+    C[:2, 2] = -Mc
+    C[2, :2] = -Mc
+    C[2, 2] = c @ M @ c - 1.0
+    return C
+
+
+def conic_center_recovery(
+    ellipse: dict, K: np.ndarray
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Recover projected 3D-circle center from its image ellipse via conic back-projection.
+
+    Under perspective projection the ellipse center != projected circle center.
+    This uses the pole-polar relationship on the back-projected cone to correct the bias.
+
+    Returns (corrected_center_xy, normal_camera) or None on degeneracy.
+    """
+    C = ellipse_to_conic_matrix(ellipse)
+    K_inv = np.linalg.inv(K)
+    Q = K_inv.T @ C @ K_inv
+    Q = (Q + Q.T) / 2.0
+
+    eigvals, eigvecs = np.linalg.eigh(Q)  # ascending
+    l1, l2, l3 = eigvals
+
+    # Valid circle projection: signature (+,+,-) → after eigh: l1 < 0 < l2 <= l3
+    if l1 >= 0 or l3 <= 0 or abs(l2) < 1e-12:
+        return None
+
+    s1 = np.sqrt(abs((l2 - l1) / (l3 - l1)))
+    s3 = np.sqrt(abs((l3 - l2) / (l3 - l1)))
+    v1, v3 = eigvecs[:, 0], eigvecs[:, 2]
+
+    candidates = []
+    for n in [s1 * v3 + s3 * v1, s1 * v3 - s3 * v1]:
+        vanishing_line = K_inv.T @ n
+        try:
+            C_inv = np.linalg.inv(C)
+        except np.linalg.LinAlgError:
+            continue
+        ch = C_inv @ vanishing_line
+        if abs(ch[2]) < 1e-10:
+            continue
+        candidates.append((ch[:2] / ch[2], n))
+
+    if not candidates:
+        return None
+
+    ec = np.array(ellipse["center_xy"])
+    return min(candidates, key=lambda r: np.linalg.norm(r[0] - ec))
+
+
+# ---------------------------------------------------------------------------
+#  Real-time estimator
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CenterHoleResult:
+    """Output of HolePoseEstimator.estimate()."""
+    center_xy: Optional[np.ndarray] = None   # pixel coords of center hole
+    confidence: float = 0.0                   # 0-1 integrated belief
+    source: str = "none"                      # "conic" | "ellipse" | "line" | "ema_*" | "none"
+    pose: Optional[dict] = None               # 3D pose from solvePnP
+    detections: List[dict] = field(default_factory=list)
+
+
+class HolePoseEstimator:
+    """Two-tier real-time center-hole pose estimator.
+
+    Tier 1 (reliable): CenterHole + CenterHole_B both detected with high
+        reliability → conic-based center recovery on the inner circle.
+    Tier 2 (fallback): Fit ellipses on all detections, use line fitting
+        to estimate center position from the point cloud.
+
+    Temporal EMA filter smooths the output with belief-weighted alpha.
+    """
+
+    CENTER_OUTER = 0   # CenterHole_B  (slot 0.072x0.040)
+    CENTER_INNER = 1   # CenterHole    (circle d=0.026)
+    GUIDE_OUTER = 2
+    GUIDE_INNER = 3
+
+    OUTER_AR_THRESHOLD = 1.3  # aspect-ratio gate for slot verification
+
+    def __init__(
+        self,
+        weights_path: str,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        device: str = "0",
+        conf_threshold: float = 0.5,
+        kp_conf: float = 0.15,
+        reliability_threshold: float = 0.6,
+        sigma: float = 20.0,
+    ):
+        self.model = YOLO(weights_path)
+        self.K = camera_matrix
+        self.dist = dist_coeffs
+        self.device = device
+        self.conf_threshold = conf_threshold
+        self.kp_conf = kp_conf
+        self.reliability_threshold = reliability_threshold
+        self.sigma = sigma
+
+    # ------------------------------------------------------------------
+    #  Public API
+    # ------------------------------------------------------------------
+
+    def estimate(self, img_bgr: np.ndarray) -> CenterHoleResult:
+        """Estimate center-hole position from a single BGR frame (stateless)."""
+        results = self.model.predict(
+            source=img_bgr, conf=self.conf_threshold,
+            device=self.device, verbose=False,
+        )
+        r = results[0]
+
+        if r.boxes is None or r.keypoints is None or len(r.boxes) == 0:
+            return CenterHoleResult()
+
+        detections = self._parse_detections(r)
+
+        # --- Tier 1 ---
+        t1 = self._tier1_conic(detections)
+        if t1 is not None:
+            t1.detections = detections
+            return t1
+
+        # --- Tier 2 ---
+        t2 = self._tier2_line_fitting(detections)
+        t2.detections = detections
+        return t2
+
+    # ------------------------------------------------------------------
+    #  Detection parsing
+    # ------------------------------------------------------------------
+
+    def _parse_detections(self, result) -> List[dict]:
+        boxes = result.boxes.xyxy.cpu().numpy()
+        scores = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        keypoints = result.keypoints.data.cpu().numpy()
+
+        # Build all detections
+        all_dets: dict[int, list] = {}
+        for i in range(len(boxes)):
+            kxy = keypoints[i, :, :2].astype(np.float64)
+            kc = keypoints[i, :, 2].astype(np.float64)
+            ell = fit_boundary_ellipse(kxy[1:], kc[1:], self.kp_conf)
+            d = {
+                "class_id": int(classes[i]),
+                "conf": float(scores[i]),
+                "bbox": boxes[i],
+                "kp0_xy": kxy[0],
+                "kp0_conf": float(kc[0]),
+                "kpts_xy": kxy,
+                "kpts_conf": kc,
+                "ellipse": ell,
+            }
+            all_dets.setdefault(d["class_id"], []).append(d)
+
+        # Keep only the highest-conf detection per class
+        dets = []
+        for cls_dets in all_dets.values():
+            dets.append(max(cls_dets, key=lambda d: d["conf"]))
+        return dets
+
+    # ------------------------------------------------------------------
+    #  Tier 1 — conic recovery (inner circle)
+    # ------------------------------------------------------------------
+
+    def _tier1_conic(self, dets: List[dict]) -> Optional[CenterHoleResult]:
+        outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
+        inner = self._best_of_class(dets, self.CENTER_INNER)
+        if outer is None or inner is None:
+            return None
+        if outer["ellipse"] is None or inner["ellipse"] is None:
+            return None
+
+        oc = outer["ellipse"]["center_xy"]
+        ic = inner["ellipse"]["center_xy"]
+        dist_px = float(np.linalg.norm(oc - ic))
+
+        reliability = outer["conf"] * inner["conf"] / (1.0 + dist_px / self.sigma)
+        if reliability < self.reliability_threshold:
+            return None
+
+        # Conic recovery on inner (it IS a circle → formula valid)
+        corrected = conic_center_recovery(inner["ellipse"], self.K)
+        if corrected is not None:
+            center_xy, _normal = corrected
+            source = "conic"
+        else:
+            center_xy = ic.copy()
+            source = "ellipse"
+
+        pose = self._solve_for(inner, center_xy)
+        return CenterHoleResult(center_xy=center_xy, confidence=reliability,
+                                source=source, pose=pose)
+
+    # ------------------------------------------------------------------
+    #  Tier 2 — line fitting from all detections
+    # ------------------------------------------------------------------
+
+    def _tier2_line_fitting(self, dets: List[dict]) -> CenterHoleResult:
+        # 2a: CenterHole_B (outer) alone — AR-verified, so trustworthy
+        outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
+        if outer is not None and outer["ellipse"] is not None:
+            center = outer["ellipse"]["center_xy"].copy()
+            pose = self._solve_for(outer, center)
+            return CenterHoleResult(center_xy=center, confidence=outer["conf"] * 0.7,
+                                    source="ellipse", pose=pose)
+
+        # 2b: CenterHole (inner) alone can't be distinguished from guide_hole_inner
+        #     → fall through to line fitting with all detections
+
+        # Collect all ellipse centers → fit line
+        pts = []
+        for d in dets:
+            if d["ellipse"] is not None:
+                pts.append(d["ellipse"]["center_xy"])
+        if len(pts) < 2:
+            return CenterHoleResult()
+
+        pts = np.array(pts)
+        mean = pts.mean(axis=0)
+        _, _, Vt = np.linalg.svd(pts - mean)
+        direction = Vt[0]
+        projs = (pts - mean) @ direction
+        mid = (projs.max() + projs.min()) / 2.0
+        estimated = mean + mid * direction
+
+        avg_conf = np.mean([d["conf"] for d in dets if d["ellipse"] is not None])
+        return CenterHoleResult(center_xy=estimated, confidence=float(avg_conf * 0.4),
+                                source="line")
+
+    # ------------------------------------------------------------------
+    #  Helpers
+    # ------------------------------------------------------------------
+
+    def _best_of_class(self, dets: List[dict], cls: int,
+                       verify_ar: bool = False) -> Optional[dict]:
+        cands = [d for d in dets if d["class_id"] == cls]
+        if verify_ar:
+            verified = []
+            for c in cands:
+                if c["ellipse"] is not None:
+                    ax = c["ellipse"]["axes_px"]
+                    ar = max(ax) / (min(ax) + 1e-6)
+                    if ar >= self.OUTER_AR_THRESHOLD:
+                        verified.append(c)
+            cands = verified
+        return max(cands, key=lambda d: d["conf"]) if cands else None
+
+    def _solve_for(self, det: dict, center_xy: np.ndarray) -> Optional[dict]:
+        obj = build_object_keypoints(det["class_id"])
+        img = det["kpts_xy"].copy()
+        img[0] = center_xy
+        valid = det["kpts_conf"] >= self.kp_conf
+        valid[0] = True
+        if valid.sum() < 4:
+            return None
+        return solve_pose(obj[valid], img[valid], self.K, self.dist)
 
 
 def solve_pose(object_points: np.ndarray, image_points: np.ndarray,
