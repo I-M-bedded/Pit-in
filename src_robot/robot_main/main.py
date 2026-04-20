@@ -11,8 +11,9 @@ from fastech import servo_state as ss
 from leadshine import agv_dummy as aj
 from controller import ik
 from config import RobotConfig
-from suprevisor import TopPlateSupervisor # Supervisor Import
-from robot_test.macro_micro import HybridController, ControlConfig as PBVSConfig
+from suprevisor import TopPlateSupervisor  # Supervisor import
+from robot_test.macro_micro import ControlConfig as PBVSConfig, SingleSideController
+from robot_test.unified_controller import TCPcontroller
 
 if platform.system() == 'Linux':
     is_windows = False
@@ -51,7 +52,8 @@ class robot:
         self.pingap = ik.niro_gap
         self.ikmode = True
         
-        self.pbvs_ctrl = HybridController(self.topik, PBVSConfig(version=self.config.version))
+        self.pbvs_side_ctrl = SingleSideController(self.topik, PBVSConfig(version=self.config.version))
+        self.pbvs_tcp_ctrl = TCPcontroller(self.topik, PBVSConfig(version=self.config.version))
         
         # 3. Shared State
         self.c_pos = [0]*7
@@ -82,16 +84,16 @@ class robot:
         # 4. Supervisor Init
         self.supervisor = TopPlateSupervisor(self)
 
-        # 5. Thread Start (수정된 부분)
+        # 5. Start background threads.
         self.threads = []
 
-        # (1) ROS2 스레드
+        # (1) ROS2 thread
         if is_ros_if: 
             t = threading.Thread(target=self.agv_planning_main, daemon=True)
             t.start()
             self.threads.append(t)
 
-        # (2) 조이스틱/GUI 스레드
+        # (2) Joystick / GUI thread
         if is_windows: 
             t = threading.Thread(target=self.pygame_gui, daemon=True)
             t.start()
@@ -101,20 +103,20 @@ class robot:
             t.start()
             self.threads.append(t)
 
-        # (3) 서보 제어 스레드
+        # (3) Servo control threads
         if self.is_real_robot:
             for servo in self.servos:
-                # 인자가 있는 경우 args 사용
+                # Pass the servo instance through args.
                 t = threading.Thread(target=self.control_servo, args=(servo,), daemon=True)
                 t.start()
                 self.threads.append(t)
      
-        # (4) AGV 제어 스레드
+        # (4) AGV control thread
         t = threading.Thread(target=self.control_agv, daemon=True)
         t.start()
         self.threads.append(t)
 
-        # (5) Supervisor 스레드
+        # (5) Supervisor thread
         t = threading.Thread(target=self.supervisor.run_loop, daemon=True)
         t.start()
         self.threads.append(t)                                                                             
@@ -192,7 +194,7 @@ class robot:
     def joystick(self):
             multi_command_flag = True
 
-            # 1. 컨트롤러 연결  
+            # 1. Connect the controller.
             if not is_windows:
                 from controller import evdev_controlthread as evct
                 controller = evct.controller()
@@ -202,19 +204,17 @@ class robot:
                     print(">>> Controller Connected via evdev")
                 except Exception as e:
                     print(f">>> Controller Connect Fail: {e}")
-                    return # 연결 실패시 스레드 종료 혹은 재시도 로직 필요
+                    return  # Stop this thread on connection failure.
 
-            # 2. 데이터 수집 루프
+            # 2. Input polling loop
             while not self.process_command:
                 if not is_windows:
                     try:
                         while multi_command_flag:
                             multi_command_flag = controller.joystick_get_data()
                         
-                        # [핵심 수정] robot의 변수가 아니라 InputManager를 업데이트해야 함!
-                        # self.axes = controller.axes (불필요, 필요하다면 유지)
-                        
-                        # 끊어진 연결 복구:
+                        # Update the shared InputManager instead of storing
+                        # controller state on the robot object directly.
                         self.input_manager.update(controller.axes, controller.buttons, controller.hat)
                         
                         multi_command_flag = True
@@ -244,22 +244,22 @@ if __name__ == "__main__":
     controller = robot(my_config)
     
     try:
-        # process_command가 1이 될 때까지(종료 신호) 대기
+        # Wait until shutdown is requested.
         while not controller.process_command:
             time.sleep(1)
     except KeyboardInterrupt:
-        # Ctrl+C 눌렀을 때 안전하게 종료 신호 전송
+        # Forward a clean shutdown signal on Ctrl+C.
         controller.process_command = 1
         print("\nStopping robot...")
     if is_ros_if:
-        # 2. controller 안에 'ros'라는 객체가 실제로 생성되었는지 확인
+        # Confirm that the ROS node was actually created.
         if hasattr(controller, 'ros'):
             controller.ros.destroy_node()
         
-        # 3. rclpy 종료
+        # Shut down rclpy if needed.
         try:
             rif.rclpy.shutdown()
         except Exception:
-            pass # 이미 꺼져있으면 패스
+            pass  # Already shut down.
 
     print("Program was down successfully")

@@ -1,4 +1,4 @@
-import time
+﻿import time
 import sys
 import os
 import numpy as np
@@ -77,7 +77,7 @@ class SystemMonitor:
             self.robot.agv.presetnum = 0
 
 class HomingTask(BaseTask):
-    """상부모듈 호밍 작업 클래스 (원점 복귀)"""
+    """Top-module homing sequence with a stepwise recovery flow."""
     def start(self):
         if not self.is_active:
             self.is_active = True; self.step = 0; self.flag = False
@@ -91,8 +91,8 @@ class HomingTask(BaseTask):
         
         if self.step == 0:
             if not self.flag: self.timer = time.time(); self.flag = True
-            # [수정 1] 5번 인덱스를 2(Homing) -> 3(Servo Off)으로 변경
-            # 원본: [2, 2, 1, 3, 3, 2, 2]
+            # Keep axis 5 servo-off during the first homing step.
+            # Original sequence was [2, 2, 1, 3, 3, 2, 2].
             self.robot.t_action = [2, 2, 1, 3, 3, 3, 2] 
             
             condition = servos[2].is_originfinding_ok if cfg.version != 1 else True
@@ -101,21 +101,21 @@ class HomingTask(BaseTask):
 
         elif self.step == 1:
             if not self.flag: self.timer = time.time(); self.flag = True
-            # [수정 2] 5번 인덱스를 1(Origin) -> 3(Servo Off)으로 변경
-            # 원본: [1, 1, 0, 3, 3, 1, 1]
+            # Keep axis 5 disabled during the second homing step as well.
+            # Original sequence was [1, 1, 0, 3, 3, 1, 1].
             self.robot.t_action = [1, 1, 0, 3, 3, 3, 1]
 
-            # [수정 3] servos[5].is_originfinding_ok 조건 삭제
-            # 고장난 모터의 완료 신호를 기다리지 않도록 합니다.
+            # Do not wait for servo 5 homing completion in this branch.
+            # This path intentionally ignores the broken axis-5 origin signal.
             if (time.time() - self.timer > cfg.homing_timeout_step_1) and \
                servos[0].is_originfinding_ok and servos[1].is_originfinding_ok and \
-               servos[6].is_originfinding_ok: # servos[5] 제거됨
+               servos[6].is_originfinding_ok:
                 self.step = 2; self.flag = False
 
         elif self.step == 2:
             if not self.flag: self.timer = time.time(); self.flag = True
-            # [수정 4] 5번 모터는 계속 3(Off) 혹은 움직이지 않도록 설정
-            # 원본: [0, 0, 0, 2, 2, 0, 0] (0은 위치제어이므로 3으로 바꾸는게 안전함)
+            # Keep axis 5 disabled while the wing pair continues homing.
+            # Original sequence was [0, 0, 0, 2, 2, 0, 0].
             self.robot.t_action = [0, 0, 0, 2, 2, 3, 0] 
             
             if time.time() - self.timer > getattr(cfg, 'homing_timeout_step_3', 3.0):
@@ -123,7 +123,7 @@ class HomingTask(BaseTask):
 
         elif self.step == 3:
             if not self.flag: self.timer = time.time(); self.flag = True
-            # [수정 5] 여기도 안전하게 3으로 변경
+            # Keep the same axis-5 protection during the next step.
             self.robot.t_action = [0, 0, 0, 1, 1, 3, 0]
             
             if (time.time() - self.timer > getattr(cfg, 'homing_timeout_step_4', 3.0)) and \
@@ -133,20 +133,20 @@ class HomingTask(BaseTask):
         elif self.step == 4:
             if not self.flag: self.timer = time.time(); self.flag = True
             
-            # [수정 6] 마지막 원점 이동 시 5번 모터가 0으로 가는 것 방지
+            # Finalize while forcing axis 5 to stay servo-off.
             self.robot.t_action = [0]*7
-            self.robot.t_action[5] = 3 # 5번만 Servo Off 강제
+            self.robot.t_action[5] = 3
             
             self.robot.t_pos = [0]*7
-            # 만약 t_action이 0(위치제어)인데 t_pos가 0이면 모터가 강제로 0위치로 이동하려 듭니다.
-            # 5번 모터는 현재 위치를 유지하거나 명령을 무시해야 합니다.
+            # Preserve the current axis-5 position so it does not get pulled to zero.
+            # This prevents an unintended move when t_action returns to position mode.
             self.robot.t_pos[5] = self.robot.c_pos[5] 
 
             if time.time() - self.timer > getattr(cfg, 'homing_timeout_step_3', 3.0):
                 self.step = 5; self.flag = False
 
         else:
-            # ... (기존 코드 동일) ...
+            # Final completion branch.
             self.robot.agv.op_state[0] = 255; self.robot.agv.presetnum = 0
             self.robot.was_home = True
             self.robot.agv.lift_state_ros |= 0x0004
@@ -155,7 +155,7 @@ class HomingTask(BaseTask):
 
 
 class LoadingTask(BaseTask):
-    """상부모듈 적재 작업 클래스"""
+    """Top-module loading task."""
     def start_approach(self):
         if not self.is_active:
             self.is_active = True; self.mode = 1; self.flag = False
@@ -196,8 +196,8 @@ class LoadingTask(BaseTask):
             print("Loading Task Finished")
 
 class ManualpinTask(BaseTask):
-    """상부모듈 수동 제어 클래스"""
-    # [Lift 기능] - n: 축 번호, dir: 방향 (1: 증가, -1: 감소, 0: 정지), rot: 회전 모드 플래그
+    """Manual top-module control task."""
+    # Lift helper: n = axis index, dir = {1, -1, 0}, rot toggles rotation mode.
     def lift(self, n, dir, rot=0):
         self.robot.t_action[n] = 0
         if dir == 0:
@@ -213,7 +213,7 @@ class ManualpinTask(BaseTask):
             delta = self.config.factor_lift * self.factor
             self.robot.t_pos[n] = self.robot.c_pos[n] + (delta * dir)
 
-    # [Pin 기능] - n: 축 번호, dir: 방향 (1: 증가, -1: 감소, 0: 정지), rot: 회전 모드 플래그
+    # Pin helper: n = axis index, dir = {1, -1, 0}, rot toggles rotation mode.
     def pin_control(self, n, dir, rot=0):
         self.robot.t_action[n] = 0
         if dir == 0:
@@ -229,13 +229,13 @@ class ManualpinTask(BaseTask):
             delta = self.config.factor_pin_adjust
             target = self.robot.servos[n].com_apos + (delta * dir)
             
-            # 높이 제한
+            # Clamp the commanded pin height.
             if dir > 0:
                 self.robot.t_pos[n] = min(target, self.config.max_pin_height_big)
             else:
                 self.robot.t_pos[n] = max(target, 0)
     
-    # [Wing Gap 기능]
+    # Wing gap helper.
     def wing_gap(self, dir):
         # dir: 1 (Expand), -1 (Shorten)
         delta = 0.001 * dir
@@ -248,7 +248,7 @@ class ManualpinTask(BaseTask):
         self.robot.t_pos[3] = int(qd[3]); self.robot.t_pos[4] = int(qd[4])
         print(f"Wing Gap: {self.robot.pingap:.3f}")
 
-    # [System 기능] - 리셋, 버저, 서보
+    # System helper: reset, buzzer stop, and servo on/off.
     def system_control(self, mode, val=0):
         if mode == 'reset':
              self.robot.reset = True
@@ -269,7 +269,7 @@ class ManualpinTask(BaseTask):
                  self.robot.manual_servo_flag = True
                  self.robot.is_fastech_on = False
 
-#연구할 부분.
+# Vision and dataset capture utilities.
 class VisionTask(BaseTask):
     def __init__(self, robot):
         super().__init__(robot)
@@ -395,30 +395,30 @@ class VisionTask(BaseTask):
             pipeline.stop()
     
     def save_data(self):
-    # 1. 로봇 상태 및 순운동학(FK) 업데이트
+        # 1. Update robot state and forward kinematics.
         self.robot.topik.get_q(self.robot.c_pos)
         self.robot.topik.fk()
         robot_yaw = self.robot.c_pos[3]*self.robot.topik.cnt2m[3]
         
-        # 3. 동적 마커 데이터 가져오기 (self.agv.detected_markers)
+        # 2. Load the currently detected markers.
         # {id: {'x':.., 'y':.., 'z':.., 'qx':.., 'qy':.., 'qz':.., 'qw':.., 'stamp':..}}
         markers = self.robot.agv.detected_markers
-        sorted_ids = sorted(markers.keys())  # ID 순으로 정렬하여 일관성 유지
+        sorted_ids = sorted(markers.keys())
         
-        # 데이터셋 구성 (최대 2개의 마커를 나란히 저장)
+        # 3. Build a fixed-width marker record for up to two markers.
         marker_data = []
-        for i in range(2):  # Marker 1, Marker 2 공간 확보
+        for i in range(2):
             if i < len(sorted_ids):
                 m_id = sorted_ids[i]
                 m_info = markers[m_id]
                 marker_data += [m_id, m_info['x'], m_info['y'], m_info['z'], 
                                 m_info['qx'], m_info['qy'], m_info['qz'], m_info['qw']]
             else:
-                # 감지된 마커가 2개 미만일 경우 빈칸(또는 0.0) 처리
+                # Pad missing marker slots with neutral values.
                 marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 
-        # 4. 헤더 및 행 데이터 구성
-        # FK 포즈(X0) + 마커1 마커2 정보
+        # 4. Assemble CSV header and row data.
+        # Store the robot center pose followed by up to two marker records.
         header = [
             "robot_x", "robot_y", "robot_th",
             "m1_id", "m1_x", "m1_y", "m1_z", "m1_qx", "m1_qy", "m1_qz", "m1_qw",
@@ -429,7 +429,7 @@ class VisionTask(BaseTask):
         center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
         row_data = [center_x, center_y] + [robot_yaw]+ marker_data
 
-        # 5. CSV 파일 저장
+        # 5. Append to the calibration CSV file.
         filename = "Calibration_data.csv"
         file_exists = os.path.isfile(filename)
 
@@ -446,14 +446,14 @@ class _PbvsBase(BaseTask):
 
     Vision node publishes hole position in the robot world frame on /cam0
     (left) / /cam1 (right).  We feed that world point straight into the
-    HybridController, so both ``target_xy`` and ``world_raw`` are expressed
-    in world coordinates — no pin/camera transforms needed here.
+    SingleSideController, so both ``target_xy`` and ``world_raw`` are
+    expressed in world coordinates with no pin/camera transforms here.
     """
     SIDE: str = ''
 
     def __init__(self, robot):
         super().__init__(robot)
-        self.ctrl = robot.pbvs_ctrl
+        self.ctrl = robot.pbvs_side_ctrl
 
     def start(self):
         if not self.is_active:
@@ -463,7 +463,7 @@ class _PbvsBase(BaseTask):
 
             self.ctrl.set_target(target_xy, side=self.SIDE, cartype=self.robot.agv.cartype)
             self.robot.t_action = [0] * 7
-            print(f"PBVS Task Started — {self.SIDE} pin (world target: {target_xy})")
+            print(f"PBVS Task Started - {self.SIDE} pin (world target: {target_xy})")
 
     def _get_world_hole(self, side):
         if side == 'left':
@@ -491,10 +491,74 @@ class _PbvsBase(BaseTask):
 
 
 class PbvsLTask(_PbvsBase):
-    """PBVS for Left pin — triggered by LT+Y."""
+    """PBVS for the left pin, triggered by LT+Y."""
     SIDE = 'left'
 
 
 class PbvsRTask(_PbvsBase):
-    """PBVS for Right pin — triggered by RT+Y."""
+    """PBVS for the right pin, triggered by RT+Y."""
     SIDE = 'right'
+
+
+class PbvsBothTask(BaseTask):
+    """Dual-pin PBVS triggered by LT+RT."""
+
+    def __init__(self, robot):
+        super().__init__(robot)
+        self.tcp_ctrl = robot.pbvs_tcp_ctrl
+        self._mode = None
+        self._targets = {}
+
+    def start(self):
+        if self.is_active:
+            return
+        from robot_test.jacobian_solver import ReachMode
+
+        target_l = np.array(self.robot.agv.lcam_hole_pos, dtype=float)
+        target_r = np.array(self.robot.agv.rcam_hole_pos, dtype=float)
+        self._targets = {'left': target_l[:2], 'right': target_r[:2]}
+
+        cartype = self.robot.agv.cartype
+        mode, info = self.tcp_ctrl.set_targets(target_l[:2], target_r[:2], cartype)
+
+        print(f"\n[PBVS BOTH] Reachability: {mode.name}")
+        for k, v in info.items():
+            print(f"  {k}: {v}")
+
+        self._mode = mode
+        if mode in (ReachMode.BOTH, ReachMode.SEQUENTIAL, ReachMode.ONE_SIDE):
+            self.is_active = True
+            self.robot.t_action = [0] * 7
+            print(f"[PBVS BOTH] Controller started in mode: {mode.name}")
+        else:
+            self.robot.agv.op_state[0] = 254
+            print("[PBVS BOTH] ERROR - both pins unreachable!")
+
+    def run(self):
+        if not self.is_active:
+            return
+        from robot_test.macro_micro import FinishReason
+
+        wl = np.array(self.robot.agv.lcam_hole_pos, dtype=float)
+        wr = np.array(self.robot.agv.rcam_hole_pos, dtype=float)
+        cp = np.array(self.robot.c_pos, dtype=float)
+        q_cnt = self.tcp_ctrl.step(world_raw_l=wl, world_raw_r=wr, current_c_pos=cp)
+
+        for i in range(7):
+            self.robot.t_action[i] = 0
+        for i in range(5):
+            self.robot.t_pos[i] = q_cnt[i]
+
+        if self.tcp_ctrl.is_done:
+            reason = self.tcp_ctrl.finish_reason
+            if reason == FinishReason.SUCCESS:
+                print(f"[PBVS BOTH] {self._mode.name} completed.")
+                self.robot.agv.op_state[0] = 255
+            else:
+                print(f"[PBVS BOTH] FAILED ({reason.name})")
+                self.robot.agv.op_state[0] = 254
+            self.reset()
+
+    def reset(self):
+        super().reset()
+        self._mode = None
