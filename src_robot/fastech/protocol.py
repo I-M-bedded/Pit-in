@@ -652,11 +652,9 @@ class fastech:
                         if self.com_apos==self.desired_pos:
                             pass
                         else:
-                            if getattr(self, 'last_sent_pos', None) != self.desired_pos:
-                                try: 
-                                    self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
-                                    self.last_sent_pos = self.desired_pos
-                                except: print(f"bad comm state for set move {self.id}")
+                            try: 
+                                self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
+                            except: print(f"bad comm state for set move {self.id}")
                 elif self.desired_action==4:
                     if self.desired_pos==self.com_apos:
                         pass
