@@ -238,24 +238,25 @@ class VisionNode(Node):
         """Return True when FK is available and world-frame publishing is valid."""
         return self._fk_ready and self._topik is not None
 
-    def _compute_prior_xy(
+    def _compute_prior(
         self, cam_to_world: np.ndarray, cam_origin: np.ndarray
-    ) -> Optional[np.ndarray]:
-        """Project the previous WorldTracker estimate into current image pixel coords.
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Project the previous WorldTracker estimate into current camera coords.
 
         Used by Case-2b to resolve the symmetric line-direction ambiguity.
-        Returns (u, v) pixel or None when no prior exists or is behind the camera.
+        Returns (pixel_xy, tvec_cam) or (None, None) when no prior exists or
+        the previous world estimate is behind the current camera.
         """
         prev_world = self.tracker.get_world_position()
         if prev_world is None:
-            return None
+            return None, None
         tvec_cam = cam_to_world.T @ (prev_world - cam_origin)
         if tvec_cam[2] <= 0:
-            return None
+            return None, None
         K = self.estimator.K
         u = K[0, 0] * tvec_cam[0] / tvec_cam[2] + K[0, 2]
         v = K[1, 1] * tvec_cam[1] / tvec_cam[2] + K[1, 2]
-        return np.array([u, v], dtype=np.float64)
+        return np.array([u, v], dtype=np.float64), tvec_cam.astype(np.float64)
 
     # ------------------------------------------------------------------
     #  Main loop
@@ -278,11 +279,15 @@ class VisionNode(Node):
         # 1. FK snapshot (needed before estimate for prior_xy)
         cam_to_world, cam_origin = self._get_cam_to_world()
 
-        # 2. Project previous world estimate → pixel prior for Case-2b disambiguation
-        prior_xy = self._compute_prior_xy(cam_to_world, cam_origin)
+        # 2. Project previous world estimate into the current camera frame.
+        prior_xy, prior_tvec_cam = self._compute_prior(cam_to_world, cam_origin)
 
         # 3. YOLO → solvePnP tvec in camera frame
-        result = self.estimator.estimate(color_image, prior_xy=prior_xy)
+        result = self.estimator.estimate(
+            color_image,
+            prior_xy=prior_xy,
+            prior_tvec_cam=prior_tvec_cam,
+        )
 
         # 4. World-space EMA (ambiguity resolution + temporal filter)
         world_est = self.tracker.update(result, cam_to_world, cam_origin)

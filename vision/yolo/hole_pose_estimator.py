@@ -387,8 +387,8 @@ class HolePoseEstimator:
         Use paired center detections and recover the inner-hole pose directly
         from the fitted conic when both center classes agree.
     Tier 2a:
-        Use a single reliable center detection. Inner uses conic recovery;
-        outer keeps the detector center and solvePnP.
+        Use a single reliable inner-center detection with conic recovery.
+        Outer-only center detections fall through to Tier 2b geometry matching.
     Tier 2b:
         Build hybrid 3-D hole anchors from boundary geometry and kp0 rescue,
         cluster them by physical hole, then match the row against the board
@@ -444,6 +444,7 @@ class HolePoseEstimator:
         self,
         img_bgr: np.ndarray,
         prior_xy: Optional[np.ndarray] = None,
+        prior_tvec_cam: Optional[np.ndarray] = None,
     ) -> CenterHoleResult:
         """Estimate center-hole position from a single BGR frame (stateless).
 
@@ -453,6 +454,9 @@ class HolePoseEstimator:
                       WorldTracker world estimate.  Used by Tier-2b to resolve
                       the line-direction ambiguity caused by the symmetric hole
                       layout.  Pass None when no prior is available.
+            prior_tvec_cam: Previous world estimate transformed into the current
+                            camera frame.  When available, Tier-2b uses this
+                            metric prior to score all board-offset combos.
         """
         results = self.model.predict(
             source=img_bgr, conf=self.conf_threshold,
@@ -472,7 +476,7 @@ class HolePoseEstimator:
             return t1
 
         # --- Tier 2 ---
-        t2 = self._tier2_line_fitting(detections, prior_xy)
+        t2 = self._tier2_line_fitting(detections, prior_xy, prior_tvec_cam)
         t2.detections = detections
         return t2
 
@@ -562,17 +566,16 @@ class HolePoseEstimator:
         self,
         dets: List[dict],
         prior_xy: Optional[np.ndarray] = None,
+        prior_tvec_cam: Optional[np.ndarray] = None,
     ) -> CenterHoleResult:
         # ------------------------------------------------------------------
-        # Case 2a: single reliable center detection.
+        # Case 2a: single reliable inner-center detection.
         #
-        # Preference order:
-        #   1. Inner center alone with confidence above INNER_ALONE_CONF.
-        #      Inner is a true circle, so conic recovery is the preferred path.
-        #   2. AR-verified outer center slot.
-        #      For the slot we keep kp0 and solvePnP directly.
+        # Inner is a true circle, so conic recovery is the preferred path.
+        # Outer center slots are not used as a standalone 2a pose source; they
+        # continue into Case 2b where the row geometry can constrain them.
         # ------------------------------------------------------------------
-        # Case 2a (i): reliable inner center alone -> conic recovery.
+        # Case 2a: reliable inner center alone -> conic recovery.
         inner = self._best_of_class(dets, self.CENTER_INNER)
         if (inner is not None
                 and inner["ellipse"] is not None
@@ -588,16 +591,6 @@ class HolePoseEstimator:
                 source = "ellipse"
                 pose = self._solve_for(inner, center)
             return CenterHoleResult(center_xy=center, confidence=inner["conf"] * 0.8,
-                                    source=source, pose=pose)
-
-        # Case 2a (ii): outer slot alone -> keep kp0 and solvePnP.
-        # A slot is not a projected circle, so conic back-projection is not valid here.
-        outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
-        if outer is not None and outer["ellipse"] is not None:
-            center = outer["kpts_xy"][0].copy()
-            source = "kp0"
-            pose = self._solve_for(outer, center)
-            return CenterHoleResult(center_xy=center, confidence=outer["conf"] * 0.7,
                                     source=source, pose=pose)
 
         # ------------------------------------------------------------------
@@ -626,7 +619,12 @@ class HolePoseEstimator:
         tvecs_hat = np.stack([h[0] for h in holes], axis=0)   # (k, 3) meters
         weights   = np.array([h[1] for h in holes], dtype=np.float64)
 
-        matched = self._case2b_weighted_geometry(tvecs_hat, weights, prior_xy)
+        matched = self._case2b_weighted_geometry(
+            tvecs_hat,
+            weights,
+            prior_xy,
+            prior_tvec_cam,
+        )
         if matched is None:
             return CenterHoleResult()
 
@@ -828,6 +826,7 @@ class HolePoseEstimator:
         tvecs: np.ndarray,
         weights: np.ndarray,
         prior_xy: Optional[np.ndarray],
+        prior_tvec_cam: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[np.ndarray, float, float]]:
         """Weighted PCA + weighted LSQ against ``_BOARD_OFFSETS_M`` in m.
 
@@ -856,6 +855,7 @@ class HolePoseEstimator:
         w_sorted     = w[order]
 
         SCALE_WEIGHT = 0.01
+        PRIOR_WEIGHT = 0.35
         best: Optional[tuple] = None
 
         for combo in itertools.combinations(_BOARD_OFFSETS_M, k):
@@ -876,8 +876,29 @@ class HolePoseEstimator:
 
             residuals = projs_sorted - (s * offsets + c)
             weighted_rms = float(np.sqrt(np.sum(w_sorted * residuals ** 2)))
-            score = weighted_rms + SCALE_WEIGHT * abs(s - 1.0)
             center_3d = mean_3d + c * direction_try
+            score = weighted_rms + SCALE_WEIGHT * abs(s - 1.0)
+
+            # With only two visible holes, LSQ residuals are nearly always
+            # zero, so the previous world estimate must participate in combo
+            # selection itself instead of only resolving the final mirror.
+            if prior_tvec_cam is not None:
+                c_proj = float(np.dot(center_3d - mean_3d, direction_try))
+                mirror_3d = mean_3d - c_proj * direction_try
+                center_dist = float(np.linalg.norm(center_3d - prior_tvec_cam))
+                mirror_dist = float(np.linalg.norm(mirror_3d - prior_tvec_cam))
+                if mirror_dist < center_dist:
+                    center_3d = mirror_3d
+                    prior_dist = mirror_dist
+                else:
+                    prior_dist = center_dist
+                score += PRIOR_WEIGHT * prior_dist
+            elif prior_xy is not None:
+                center_px = self._project_cam_to_pixel(center_3d)
+                if center_px is not None:
+                    prior_px = float(np.linalg.norm(center_px - prior_xy))
+                    score += 0.0005 * min(prior_px, 200.0)
+
             if best is None or score < best[0]:
                 best = (score, weighted_rms, center_3d, direction_try, s)
 
@@ -886,7 +907,7 @@ class HolePoseEstimator:
 
         _, residual, center_3d, direction, scale = best
 
-        if prior_xy is not None:
+        if prior_tvec_cam is None and prior_xy is not None:
             c_proj = float(np.dot(center_3d - mean_3d, direction))
             mirror_3d = mean_3d - c_proj * direction
             center_px = self._project_cam_to_pixel(center_3d)

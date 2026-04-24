@@ -63,12 +63,16 @@ class WorldTracker:
         min_confidence: float = 0.1,
         update_min_confidence: float = 0.25,
         conf_power: float = 2.0,
+        line_confidence_scale: float = 0.85,
+        no_detection_decay: float = 1.0,
     ):
         self.ema_alpha = ema_alpha
         self.decay = decay
         self.min_confidence = min_confidence
         self.update_min_confidence = update_min_confidence
         self.conf_power = conf_power
+        self.line_confidence_scale = line_confidence_scale
+        self.no_detection_decay = no_detection_decay
 
         self._world_pos: Optional[np.ndarray] = None
         self._confidence: float = 0.0
@@ -100,11 +104,15 @@ class WorldTracker:
             Filtered world-space position and confidence.
         """
         if result.center_xy is None or result.pose is None:
+            if not result.detections:
+                return self._decay_and_return(result.source, self.no_detection_decay)
             return self._decay_and_return(result.source)
+
+        confidence = self._effective_confidence(result)
 
         # Confidence gate: drop this frame as if no measurement arrived.
         # At 15 fps this prevents 15x/sec low-conf noise from eating the EMA.
-        if result.confidence < self.update_min_confidence:
+        if confidence < self.update_min_confidence:
             return self._decay_and_return(result.source)
 
         # Camera-frame 3D position from solvePnP
@@ -115,13 +123,13 @@ class WorldTracker:
 
         # EMA update with non-linear confidence scaling — quadratic default
         # so a 0.9-conf conic frame dominates many 0.3-conf line frames.
-        alpha = self.ema_alpha * (result.confidence ** self.conf_power)
+        alpha = self.ema_alpha * (confidence ** self.conf_power)
         if self._world_pos is None:
             self._world_pos = world_pos.copy()
-            self._confidence = result.confidence
+            self._confidence = confidence
         else:
             self._world_pos = alpha * world_pos + (1.0 - alpha) * self._world_pos
-            self._confidence = alpha * result.confidence + (1.0 - alpha) * self._confidence
+            self._confidence = alpha * confidence + (1.0 - alpha) * self._confidence
 
         return WorldEstimate(
             world_xyz=self._world_pos.copy(),
@@ -133,9 +141,16 @@ class WorldTracker:
     #  Helpers
     # ------------------------------------------------------------------
 
-    def _decay_and_return(self, source: str) -> WorldEstimate:
+    def _effective_confidence(self, result: CenterHoleResult) -> float:
+        """Return tracker-side confidence after source-specific scaling."""
+        confidence = float(result.confidence)
+        if result.source == "line":
+            confidence *= self.line_confidence_scale
+        return confidence
+
+    def _decay_and_return(self, source: str, decay: Optional[float] = None) -> WorldEstimate:
         """No new measurement — decay confidence, return stale estimate."""
-        self._confidence *= self.decay
+        self._confidence *= self.decay if decay is None else decay
         if self._world_pos is not None and self._confidence >= self.min_confidence:
             return WorldEstimate(
                 world_xyz=self._world_pos.copy(),
