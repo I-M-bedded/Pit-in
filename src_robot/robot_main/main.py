@@ -12,8 +12,8 @@ from leadshine import agv_dummy as aj
 from controller import ik
 from config import RobotConfig
 from suprevisor import TopPlateSupervisor  # Supervisor import
-from robot_test.macro_micro import ControlConfig as PBVSConfig, SingleSideController
-from robot_test.unified_controller import TCPcontroller
+from robot_test.macro_micro import ControlConfig as PBVSConfig
+from robot_test.TCPcontroller import TCPcontroller
 
 if platform.system() == 'Linux':
     is_windows = False
@@ -52,7 +52,6 @@ class robot:
         self.pingap = ik.niro_gap
         self.ikmode = True
         
-        self.pbvs_side_ctrl = SingleSideController(self.topik, PBVSConfig(version=self.config.version))
         self.pbvs_tcp_ctrl = TCPcontroller(self.topik, PBVSConfig(version=self.config.version))
         
         # 3. Shared State

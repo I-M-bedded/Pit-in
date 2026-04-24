@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 """
-Estimate hole center pose from YOLO-Pose keypoints.
+Estimate hole-center pose from YOLO-Pose keypoints.
 
-This script supports:
+This module supports:
 - plain YOLO-Pose weights
 - COIN-patched YOLO-Pose weights
 - raw / CLAHE / MSRCR preprocessing
+- tiered real-time center-hole estimation for online servoing
 
 Geometry is mirrored from `vision/dataset_gen/auto_annotator.py`.
-For each detection it:
-1. collects 9 keypoints (kp_0 center + 8 boundary points),
-2. fits an ellipse on the 8 boundary points,
-3. optionally replaces kp_0 with the fitted ellipse center,
-4. solves camera-frame pose with solvePnP using the known 3D template.
+For each detection it keeps:
+1. the detector center keypoint (`kp_0`),
+2. eight boundary keypoints,
+3. a fitted ellipse when enough boundary points survive,
+4. pose hypotheses from conic recovery and/or solvePnP depending on the tier.
 
 Notes on geometry:
 - The projection of a 3D planar circle is generally an ellipse.
@@ -42,7 +43,7 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 from train_clahe_baseline import CLAHE_CLIP, CLAHE_GRID, apply_clahe
-# Lazy import — coin_pose may not exist outside training environments
+# Keep COIN-Pose optional so this file still imports in lighter environments.
 # from train_coin_pose import patch_yolo_with_coin
 from train_retinex_baseline import (
     COLOR_RESTORE_ALPHA,
@@ -54,9 +55,9 @@ from train_retinex_baseline import (
 )
 
 
-# Class naming convention (as used in training data):
-#   suffix "_B" → outer rim (larger, slot for center / 4cm circle for guide)
-#   no suffix   → inner deep hole (26mm circle)
+# Class naming convention used in the training data:
+#   suffix "_B" -> outer rim (slot for center target / 4 cm circle for guides)
+#   no suffix   -> inner hole (26 mm circle)
 # Training class IDs: 0 = CenterHole (inner), 1 = CenterHole_B (outer),
 #                     2 = Hole        (inner), 3 = Hole_B        (outer).
 CLASS_ID_TO_NAME = {
@@ -75,11 +76,24 @@ GEOMETRY_SPECS = {
     "guide_hole_inner": {"shape": "circle", "size": 0.026},
 }
 
-# Experimental board layout:  H — 14cm — H — 8cm — C — 8cm — H — 14cm — H
+# Dataset geometry uses LV1=2.5 cm for outer contours and LV2=5.5 cm for the
+# actual hole centers. Case-2b shifts every observed surface center onto this
+# common LV2 reference so inner/outer detections can be mixed consistently.
+_LV1_TO_LV2_OFFSET_M = 0.055 - 0.025
+_CANONICAL_CENTER_OFFSET_M = {
+    "center_hole_outer": _LV1_TO_LV2_OFFSET_M,
+    "center_hole_inner": 0.0,
+    "guide_hole_outer": _LV1_TO_LV2_OFFSET_M,
+    "guide_hole_inner": 0.0,
+}
+
+# Experimental board layout: H - 14 cm - H - 8 cm - C - 8 cm - H - 14 cm - H
 # Offsets of every hole CENTER from the board centre along the row [m].
 # Case-2b enumerates subsets of these to match any mixed detection cloud
 # (guides + low-confidence center all count as observation candidates).
 _BOARD_OFFSETS_M = np.array([-0.22, -0.08, 0.0, 0.08, 0.22], dtype=np.float64)
+_CASE2B_CLUSTER_DIST_M = 0.04
+_CASE2B_RESCUE_WEIGHT = 0.65
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 PNP_METHOD_NAMES = {
@@ -236,6 +250,77 @@ def ellipse_to_conic_matrix(ellipse: dict) -> np.ndarray:
     return C
 
 
+def conic_to_pose(ellipse: dict, K: np.ndarray, radius: float) -> Optional[dict]:
+    """Closed-form 3-D pose for a **circle** target from its image ellipse.
+
+    No PnP is used. Pipeline:
+      1. ``conic_center_recovery`` -> corrected pixel + plane normal.
+      2. Estimate depth from the major-semi-axis relation
+             a_major_px ~= f_eff * r / Z
+         so Z ~= f_eff * r / a_major_px.
+         This is exact for fronto-parallel circles and becomes biased under
+         strong oblique viewing.
+      3. Back-project the corrected pixel at depth Z to recover ``tvec``.
+      4. Build ``rvec`` from the plane normal. Rotation about the normal is
+         undetermined for a plain circle, so an arbitrary azimuth is used.
+
+    The returned dict matches ``solve_pose``'s schema and adds
+    ``solver_name='CONIC_CLOSED_FORM'`` plus ``corrected_xy``.
+    ``reprojection_error_px`` is left as ``None`` because no PnP reprojection
+    residual is available in this closed-form branch.
+    """
+
+    recovered = conic_center_recovery(ellipse, K)
+    if recovered is None:
+        return None
+    corrected_xy, normal = recovered
+
+    w, h = ellipse["axes_px"]
+    a_major_px = max(float(w), float(h)) / 2.0
+    if a_major_px < 1e-6:
+        return None
+
+    fx = float(K[0, 0]); fy = float(K[1, 1])
+    cx = float(K[0, 2]); cy = float(K[1, 2])
+    f_eff = float(np.sqrt(fx * fy))
+    Z = f_eff * float(radius) / a_major_px
+    if Z <= 0.0:
+        return None
+
+    u, v = float(corrected_xy[0]), float(corrected_xy[1])
+    tvec = np.array(
+        [(u - cx) / fx * Z, (v - cy) / fy * Z, Z], dtype=np.float64,
+    )
+
+    n_unit = normal / (np.linalg.norm(normal) + 1e-12)
+    if float(np.dot(n_unit, tvec)) > 0.0:
+        n_unit = -n_unit
+
+    z_axis = -n_unit
+    z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+    x_hint = np.array([1.0, 0.0, 0.0])
+    x_axis = x_hint - float(np.dot(x_hint, z_axis)) * z_axis
+    if np.linalg.norm(x_axis) < 1e-6:
+        x_hint = np.array([0.0, 1.0, 0.0])
+        x_axis = x_hint - float(np.dot(x_hint, z_axis)) * z_axis
+    x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-12)
+    y_axis = np.cross(z_axis, x_axis)
+    R = np.column_stack([x_axis, y_axis, z_axis])
+    rvec, _ = cv2.Rodrigues(R)
+
+    return {
+        "solver": -1,
+        "solver_name": "CONIC_CLOSED_FORM",
+        "rvec": rvec.reshape(-1).astype(float).tolist(),
+        "tvec_m": tvec.astype(float).tolist(),
+        "xyz_m": tvec.astype(float).tolist(),
+        "normal_camera": n_unit.astype(float).tolist(),
+        "reprojection_error_px": None,
+        "num_points": int(ellipse["num_points"]),
+        "corrected_xy": corrected_xy.astype(float).tolist(),
+    }
+
+
 def conic_center_recovery(
     ellipse: dict, K: np.ndarray
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -254,7 +339,7 @@ def conic_center_recovery(
     eigvals, eigvecs = np.linalg.eigh(Q)  # ascending
     l1, l2, l3 = eigvals
 
-    # Valid circle projection: signature (+,+,-) → after eigh: l1 < 0 < l2 <= l3
+    # Valid circle projection: signature (+,+,-) after eigh means l1 < 0 < l2 <= l3.
     if l1 >= 0 or l3 <= 0 or abs(l2) < 1e-12:
         return None
 
@@ -290,21 +375,26 @@ class CenterHoleResult:
     """Output of HolePoseEstimator.estimate()."""
     center_xy: Optional[np.ndarray] = None   # pixel coords of center hole
     confidence: float = 0.0                   # 0-1 integrated belief
-    source: str = "none"                      # "conic" | "ellipse" | "line" | "ema_*" | "none"
-    pose: Optional[dict] = None               # 3D pose from solvePnP
+    source: str = "none"                      # "conic" | "ellipse" | "kp0" | "line" | "none"
+    pose: Optional[dict] = None               # 3D pose estimate in camera frame
     detections: List[dict] = field(default_factory=list)
 
 
 class HolePoseEstimator:
-    """Two-tier real-time center-hole pose estimator.
+    """Tiered real-time center-hole pose estimator.
 
-    Tier 1 (reliable): CenterHole + CenterHole_B both detected with high
-        reliability → conic-based center recovery on the inner circle.
-    Tier 2 (fallback): Fit ellipses on all detections, use line fitting
-        to estimate center position from the point cloud.
-
-    Temporal EMA filter smooths the output with belief-weighted alpha.
+    Tier 1:
+        Use paired center detections and recover the inner-hole pose directly
+        from the fitted conic when both center classes agree.
+    Tier 2a:
+        Use a single reliable center detection. Inner uses conic recovery;
+        outer keeps the detector center and solvePnP.
+    Tier 2b:
+        Build hybrid 3-D hole anchors from boundary geometry and kp0 rescue,
+        cluster them by physical hole, then match the row against the board
+        template in metric camera space.
     """
+
 
     CENTER_INNER = 0   # CenterHole     (circle d=0.026)
     CENTER_OUTER = 1   # CenterHole_B   (slot 0.072 x 0.040)
@@ -414,7 +504,7 @@ class HolePoseEstimator:
             })
 
         # Dedup ONLY the CENTER classes (single center target per frame).
-        # GUIDE detections are kept in full — the experimental board has 4.
+        # GUIDE detections are kept because the board contains multiple holes.
         center_by_cls: dict[int, dict] = {}
         guides: List[dict] = []
         for d in all_dets:
@@ -428,7 +518,7 @@ class HolePoseEstimator:
         return list(center_by_cls.values()) + guides
 
     # ------------------------------------------------------------------
-    #  Tier 1 — conic recovery (inner circle)
+    #  Tier 1 - paired center detections with inner-hole conic recovery
     # ------------------------------------------------------------------
 
     def _tier1_conic(self, dets: List[dict]) -> Optional[CenterHoleResult]:
@@ -439,29 +529,33 @@ class HolePoseEstimator:
         if outer["ellipse"] is None or inner["ellipse"] is None:
             return None
 
-        oc = outer["ellipse"]["center_xy"]
-        ic = inner["ellipse"]["center_xy"]
+        # Tier-1 gating should compare the detector's own center predictions.
+        # Using ellipse centers here over-penalizes perspective bias.
+        oc = outer["kp0_xy"]
+        ic = inner["kp0_xy"]
         dist_px = float(np.linalg.norm(oc - ic))
 
         reliability = outer["conf"] * inner["conf"] / (1.0 + dist_px / self.sigma)
         if reliability < self.reliability_threshold:
             return None
 
-        # Conic recovery on inner (it IS a circle → formula valid)
-        corrected = conic_center_recovery(inner["ellipse"], self.K)
-        if corrected is not None:
-            center_xy, _normal = corrected
+        # Inner is a circle, so use the closed-form conic pose directly.
+        inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
+        inner_radius = float(inner_spec["size"]) / 2.0
+        pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
+        if pose is not None:
+            center_xy = np.array(pose["corrected_xy"], dtype=np.float64)
             source = "conic"
         else:
+            # Graceful fallback when conic signature is degenerate.
             center_xy = ic.copy()
             source = "ellipse"
-
-        pose = self._solve_for(inner, center_xy)
+            pose = self._solve_for(inner, center_xy)
         return CenterHoleResult(center_xy=center_xy, confidence=reliability,
                                 source=source, pose=pose)
 
     # ------------------------------------------------------------------
-    #  Tier 2 — line fitting from all detections
+    #  Tier 2 - fallback hierarchy
     # ------------------------------------------------------------------
 
     def _tier2_line_fitting(
@@ -472,28 +566,32 @@ class HolePoseEstimator:
         # ------------------------------------------------------------------
         # Case 2a: single reliable center detection.
         #
-        #   Preference order:
-        #     i.  CenterHole (inner) alone with conf ≥ INNER_ALONE_CONF.
-        #         Inner is a true circle → conic back-projection is exact.
-        #     ii. CenterHole_B (outer) AR-verified as a slot.
-        #         Outer slot geometry is often less stable, so use the model's
-        #         center keypoint directly instead of conic recovery.
+        # Preference order:
+        #   1. Inner center alone with confidence above INNER_ALONE_CONF.
+        #      Inner is a true circle, so conic recovery is the preferred path.
+        #   2. AR-verified outer center slot.
+        #      For the slot we keep kp0 and solvePnP directly.
         # ------------------------------------------------------------------
+        # Case 2a (i): reliable inner center alone -> conic recovery.
         inner = self._best_of_class(dets, self.CENTER_INNER)
         if (inner is not None
                 and inner["ellipse"] is not None
                 and inner["conf"] >= self.INNER_ALONE_CONF):
-            corrected = conic_center_recovery(inner["ellipse"], self.K)
-            if corrected is not None:
-                center, _ = corrected
+            inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
+            inner_radius = float(inner_spec["size"]) / 2.0
+            pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
+            if pose is not None:
+                center = np.array(pose["corrected_xy"], dtype=np.float64)
                 source = "conic"
             else:
                 center = inner["ellipse"]["center_xy"].copy()
                 source = "ellipse"
-            pose = self._solve_for(inner, center)
+                pose = self._solve_for(inner, center)
             return CenterHoleResult(center_xy=center, confidence=inner["conf"] * 0.8,
                                     source=source, pose=pose)
 
+        # Case 2a (ii): outer slot alone -> keep kp0 and solvePnP.
+        # A slot is not a projected circle, so conic back-projection is not valid here.
         outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
         if outer is not None and outer["ellipse"] is not None:
             center = outer["kpts_xy"][0].copy()
@@ -503,73 +601,50 @@ class HolePoseEstimator:
                                     source=source, pose=pose)
 
         # ------------------------------------------------------------------
-        # Case 2b: no reliable center-conic recovery → match ANY detection
-        #          cloud to the full board template **in camera 3D (metric)**.
+        # Case 2b: final fallback for weak center detections.
         #
-        # Board layout & offsets (m):  -0.22  -0.08   0.00  +0.08  +0.22
-        #                                 H      H     C      H      H
-        #
-        # We include BOTH guide AND center-class detections in the cloud.
-        # A low-confidence CenterHole that wasn't good enough for conic in
-        # Case 2a is still a strong geometric anchor — letting it contribute
-        # to the line fit / template match means e.g. a 3-point cloud with
-        # gaps (8 cm, 14 cm) correctly identifies"""  """ its leftmost point as
-        # the center (subset {0, +0.08, +0.22}).
-        #
-        # Per-detection solvePnP gives a metric tvec in camera frame.  We fit
-        # a 3-D line through those tvecs, project onto it (meters), then
-        # enumerate every size-k subset of `_BOARD_OFFSETS_M` and solve
-        # ``proj_i = s * offset_i + c`` in LSQ.  Physically ``s`` must be ≈ 1,
-        # so we (a) fold a negative ``s`` onto a direction flip and
-        # (b) penalise |s − 1| in the score.
-        #
-        # prior_xy (WorldTracker → pixel) breaks the remaining axis-direction
-        # ambiguity by comparing projected pixel candidates.
+        # Each detection first tries a boundary-only pose. When contour support
+        # is weak, kp0 can rescue the anchor through a separate PnP solve.
+        # Every anchor is converted to a canonical LV2 hole center, duplicate
+        # detections are clustered by physical hole, and the surviving 3-D hole
+        # centers are matched against `_BOARD_OFFSETS_M` with weighted PCA and
+        # weighted least squares.
         # ------------------------------------------------------------------
-        cloud_dets = [d for d in dets if d["ellipse"] is not None]
-        if len(cloud_dets) < 2:
+        anchors: List[Tuple[np.ndarray, float, float, dict]] = []
+        for det in dets:
+            anchor = self._estimate_case2b_hole_center(det)
+            if anchor is not None:
+                anchors.append(anchor)
+
+        if len(anchors) < 2:
             return CenterHoleResult()
 
-        # Per-detection solvePnP → metric tvecs in camera frame.
-        solved: List[Tuple[dict, dict, np.ndarray]] = []
-        for d in cloud_dets:
-            p = self._solve_for(d, d["ellipse"]["center_xy"])
-            if p is None:
-                continue
-            tvec = np.array(p["tvec_m"], dtype=np.float64)
-            if tvec[2] <= 0.0:
-                continue
-            solved.append((d, p, tvec))
-
-        if len(solved) < 2:
+        holes = self._cluster_case2b_centers(anchors)
+        if len(holes) < 2:
             return CenterHoleResult()
 
-        tvecs = np.stack([s[2] for s in solved], axis=0)  # (k, 3) meters
+        tvecs_hat = np.stack([h[0] for h in holes], axis=0)   # (k, 3) meters
+        weights   = np.array([h[1] for h in holes], dtype=np.float64)
 
-        matched = self._case2b_geometry_center_3d(tvecs, prior_xy)
+        matched = self._case2b_weighted_geometry(tvecs_hat, weights, prior_xy)
         if matched is None:
             return CenterHoleResult()
 
         center_tvec_cam, residual_m, scale = matched
 
-        # Project 3-D center back to pixel for GUI / next-frame prior.
         center_xy = self._project_cam_to_pixel(center_tvec_cam)
         if center_xy is None:
             return CenterHoleResult()
 
-        # Build a pose dict around the geometric center.  Borrow the best
-        # guide's rvec for orientation (the board is planar, so all guides
-        # share the same plane normal).
-        best = max(solved, key=lambda s: s[0]["conf"])
-        pose = dict(best[1])
+        best = max(holes, key=lambda h: h[1])
+        pose = dict(best[3])
         pose["tvec_m"] = center_tvec_cam.tolist()
         pose["xyz_m"] = center_tvec_cam.tolist()
-        pose["source"] = "case2b_line3d"
+        pose["source"] = "case2b_hybrid_line"
         pose["line_residual_m"] = residual_m
         pose["line_scale"] = scale
 
-        avg_conf = float(np.mean([s[0]["conf"] for s in solved]))
-        # 5 mm residual ≈ "quite good" on this board.
+        avg_conf = float(np.mean([h[2] for h in holes]))
         residual_gain = 1.0 / (1.0 + residual_m / 0.005)
         return CenterHoleResult(
             center_xy=center_xy,
@@ -579,62 +654,238 @@ class HolePoseEstimator:
         )
 
     # ------------------------------------------------------------------
-    #  Case 2b — 3-D geometry matching helpers
+    #  Case 2b - hybrid anchor and weighted geometry helpers
     # ------------------------------------------------------------------
 
-    def _case2b_geometry_center_3d(
+    def _estimate_case2b_hole_center(
+        self, det: dict,
+    ) -> Optional[Tuple[np.ndarray, float, float, dict]]:
+        """Recover one physical-hole center for Case-2b from one detection.
+
+        The final fallback should survive broken contours, so we build:
+        1. a boundary-only anchor when the contour is still usable
+        2. a kp0-assisted rescue anchor when boundary support collapses
+
+        Both anchors are converted onto the common LV2 hole-center reference.
+        When both exist, they are blended with a preference for the boundary
+        anchor unless it disagrees strongly with kp0 in image space.
+        """
+        class_name = CLASS_ID_TO_NAME[det["class_id"]]
+
+        boundary_pose = self._solve_for(det, include_center=False)
+        boundary_candidate = self._case2b_candidate_from_pose(
+            det, class_name, boundary_pose, use_kp0=False, source="boundary"
+        )
+
+        kp0_candidate = None
+        if det["kp0_conf"] >= self.kp_conf:
+            kp0_pose = self._solve_for(det, det["kp0_xy"], include_center=True)
+            kp0_candidate = self._case2b_candidate_from_pose(
+                det, class_name, kp0_pose, use_kp0=True, source="kp0_rescue"
+            )
+
+        if boundary_candidate is not None and kp0_candidate is not None:
+            return self._blend_case2b_candidates(det, boundary_candidate, kp0_candidate)
+        if boundary_candidate is not None:
+            center_3d, weight, conf, pose = boundary_candidate
+            pose = dict(pose)
+            pose["case2b_mode"] = "boundary_only"
+            return center_3d, weight, conf, pose
+        if kp0_candidate is not None:
+            center_3d, weight, conf, pose = kp0_candidate
+            pose = dict(pose)
+            pose["case2b_mode"] = "kp0_only"
+            return center_3d, weight, conf, pose
+        return None
+
+    def _case2b_candidate_from_pose(
+        self,
+        det: dict,
+        class_name: str,
+        pose: Optional[dict],
+        *,
+        use_kp0: bool,
+        source: str,
+    ) -> Optional[Tuple[np.ndarray, float, float, dict]]:
+        if pose is None:
+            return None
+
+        canonical = self._canonical_center_from_pose(class_name, pose)
+        if canonical is None:
+            return None
+        surface_center, hole_center = canonical
+
+        conf = float(det["conf"])
+        kp_strength = float(np.clip(det["kp0_conf"], 0.0, 1.0))
+        num_boundary = float(np.count_nonzero(det["kpts_conf"][1:] >= self.kp_conf))
+        boundary_support = min(num_boundary / 8.0, 1.0)
+        reproj = float(pose.get("reprojection_error_px", 10.0))
+        reproj_gain = 1.0 / (1.0 + reproj / 2.0)
+
+        if use_kp0:
+            support = np.clip(0.20 + 0.30 * boundary_support + 0.50 * kp_strength, 0.0, 1.0)
+            weight = (conf ** 2) * reproj_gain * support * _CASE2B_RESCUE_WEIGHT
+        else:
+            support = np.clip(0.25 + 0.75 * boundary_support, 0.0, 1.0)
+            weight = (conf ** 2) * reproj_gain * support
+
+        pose = dict(pose)
+        pose["surface_tvec_m"] = surface_center.tolist()
+        pose["canonical_center_tvec_m"] = hole_center.tolist()
+        pose["case2b_anchor_source"] = source
+        pose["case2b_support"] = float(support)
+        pose["case2b_reproj_gain"] = float(reproj_gain)
+        return hole_center, float(weight), conf, pose
+
+    def _blend_case2b_candidates(
+        self,
+        det: dict,
+        boundary_candidate: Tuple[np.ndarray, float, float, dict],
+        kp0_candidate: Tuple[np.ndarray, float, float, dict],
+    ) -> Tuple[np.ndarray, float, float, dict]:
+        b_center, b_weight, conf, b_pose = boundary_candidate
+        k_center, k_weight, _, k_pose = kp0_candidate
+
+        b_px = self._project_cam_to_pixel(b_center)
+        k_px = self._project_cam_to_pixel(k_center)
+        kp0_xy = det["kp0_xy"]
+
+        b_consistency = self._pixel_consistency_gain(b_px, kp0_xy)
+        k_consistency = self._pixel_consistency_gain(k_px, kp0_xy)
+
+        b_score = b_weight * (0.55 + 0.45 * b_consistency)
+        k_score = k_weight * (0.35 + 0.65 * k_consistency)
+        score_sum = b_score + k_score
+        alpha = b_score / score_sum if score_sum > 1e-12 else 0.5
+
+        hole_center = alpha * b_center + (1.0 - alpha) * k_center
+        agreement = max(b_consistency, k_consistency)
+        weight = (alpha * b_weight + (1.0 - alpha) * k_weight) * (0.60 + 0.40 * agreement)
+
+        pose = dict(b_pose if alpha >= 0.5 else k_pose)
+        pose["canonical_center_tvec_m"] = hole_center.tolist()
+        pose["case2b_mode"] = "hybrid"
+        pose["case2b_blend_alpha"] = float(alpha)
+        pose["case2b_boundary_weight"] = float(b_weight)
+        pose["case2b_kp0_weight"] = float(k_weight)
+        pose["case2b_boundary_consistency"] = float(b_consistency)
+        pose["case2b_kp0_consistency"] = float(k_consistency)
+        return hole_center, float(weight), conf, pose
+
+    def _cluster_case2b_centers(
+        self,
+        anchors: List[Tuple[np.ndarray, float, float, dict]],
+    ) -> List[Tuple[np.ndarray, float, float, dict]]:
+        """Merge duplicate detections that belong to the same physical hole."""
+        clusters: List[dict] = []
+
+        for center_3d, weight, conf, pose in sorted(anchors, key=lambda a: a[1], reverse=True):
+            best_idx = None
+            best_dist = float("inf")
+            for idx, cluster in enumerate(clusters):
+                dist = float(np.linalg.norm(center_3d - cluster["center_3d"]))
+                if dist < _CASE2B_CLUSTER_DIST_M and dist < best_dist:
+                    best_idx = idx
+                    best_dist = dist
+
+            if best_idx is None:
+                clusters.append({
+                    "center_3d": center_3d.copy(),
+                    "weight": float(weight),
+                    "conf_sum": float(conf),
+                    "count": 1,
+                    "best_weight": float(weight),
+                    "best_pose": pose,
+                })
+                continue
+
+            cluster = clusters[best_idx]
+            prev_weight = cluster["weight"]
+            new_weight = prev_weight + float(weight)
+            if new_weight > 0.0:
+                cluster["center_3d"] = (
+                    prev_weight * cluster["center_3d"] + float(weight) * center_3d
+                ) / new_weight
+            cluster["weight"] = new_weight
+            cluster["conf_sum"] += float(conf)
+            cluster["count"] += 1
+            if float(weight) > cluster["best_weight"]:
+                cluster["best_weight"] = float(weight)
+                cluster["best_pose"] = pose
+
+        merged: List[Tuple[np.ndarray, float, float, dict]] = []
+        for cluster in clusters:
+            merged.append((
+                cluster["center_3d"],
+                float(cluster["weight"]),
+                float(cluster["conf_sum"] / max(cluster["count"], 1)),
+                cluster["best_pose"],
+            ))
+        return merged
+
+    def _case2b_weighted_geometry(
         self,
         tvecs: np.ndarray,
+        weights: np.ndarray,
         prior_xy: Optional[np.ndarray],
     ) -> Optional[Tuple[np.ndarray, float, float]]:
-        """Match observed tvecs (camera-frame, m) to ``_BOARD_OFFSETS_M``.
+        """Weighted PCA + weighted LSQ against ``_BOARD_OFFSETS_M`` in m.
 
-        Returns
-        -------
-        (center_tvec_cam, residual_m, scale) or None
-            * center_tvec_cam : (3,) center hole position in camera frame [m]
-            * residual_m      : rms of the 1-D LSQ fit along the line [m]
-            * scale           : LSQ slope (expected ≈ 1.0)
+        Returns (center_tvec_cam, residual_m, scale) or None.
         """
         k = tvecs.shape[0]
         if k < 2:
             return None
 
-        mean_3d = tvecs.mean(axis=0)
-        _, _, Vt = np.linalg.svd(tvecs - mean_3d)
-        direction_3d = Vt[0]                          # unit vec along the row
-        projs_1d = (tvecs - mean_3d) @ direction_3d   # meters
+        w_sum = float(weights.sum())
+        if w_sum <= 0.0:
+            return None
+        w = weights / w_sum
+
+        # Weighted mean and covariance in camera-metric space.
+        mean_3d  = (w[:, None] * tvecs).sum(axis=0)
+        centered = tvecs - mean_3d
+        cov = np.einsum("i,ij,ik->jk", w, centered, centered)
+
+        eigvecs = np.linalg.eigh(cov)[1]
+        direction_3d = eigvecs[:, -1]               # principal axis (row dir)
+        projs_1d = centered @ direction_3d          # meters
 
         order = np.argsort(projs_1d)
         projs_sorted = projs_1d[order]
+        w_sorted     = w[order]
 
-        # Physical prior: slope should be ≈ 1.  Combine residual with |s - 1|.
-        SCALE_WEIGHT = 0.01  # meters contribution per unit scale-error
-        best: Optional[tuple] = None  # (score, residual, center_3d, dir, s)
+        SCALE_WEIGHT = 0.01
+        best: Optional[tuple] = None
 
         for combo in itertools.combinations(_BOARD_OFFSETS_M, k):
-            offsets = np.array(combo, dtype=np.float64)  # already ascending
+            offsets = np.array(combo, dtype=np.float64)   # ascending
             A = np.column_stack([offsets, np.ones_like(offsets)])
-            sol, *_ = np.linalg.lstsq(A, projs_sorted, rcond=None)
+            AtW = A.T * w_sorted
+            try:
+                sol = np.linalg.solve(AtW @ A, AtW @ projs_sorted)
+            except np.linalg.LinAlgError:
+                continue
             s, c = float(sol[0]), float(sol[1])
+
             if s < 0.0:
                 s, c = -s, -c
                 direction_try = -direction_3d
             else:
                 direction_try = direction_3d
-            residual = float(np.linalg.norm(A @ np.array([s, c]) - projs_sorted))
-            score = residual + SCALE_WEIGHT * abs(s - 1.0)
+
+            residuals = projs_sorted - (s * offsets + c)
+            weighted_rms = float(np.sqrt(np.sum(w_sorted * residuals ** 2)))
+            score = weighted_rms + SCALE_WEIGHT * abs(s - 1.0)
             center_3d = mean_3d + c * direction_try
             if best is None or score < best[0]:
-                best = (score, residual, center_3d, direction_try, s)
+                best = (score, weighted_rms, center_3d, direction_try, s)
 
         if best is None:
             return None
 
         _, residual, center_3d, direction, scale = best
 
-        # Mirror disambiguation via pixel prior.  Flipping the line direction
-        # mirrors the center through `mean_3d` (c → -c).
         if prior_xy is not None:
             c_proj = float(np.dot(center_3d - mean_3d, direction))
             mirror_3d = mean_3d - c_proj * direction
@@ -677,12 +928,56 @@ class HolePoseEstimator:
             cands = verified
         return max(cands, key=lambda d: d["conf"]) if cands else None
 
-    def _solve_for(self, det: dict, center_xy: np.ndarray) -> Optional[dict]:
+    def _canonical_center_from_pose(
+        self,
+        class_name: str,
+        pose: dict,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        surface_center = np.array(pose["tvec_m"], dtype=np.float64)
+        if surface_center[2] <= 0.0:
+            return None
+        z_axis = self._pose_z_axis(pose)
+        hole_center = surface_center + self._canonical_center_offset_m(class_name) * z_axis
+        if hole_center[2] <= 0.0:
+            return None
+        return surface_center, hole_center
+
+    def _pixel_consistency_gain(
+        self,
+        predicted_xy: Optional[np.ndarray],
+        observed_xy: np.ndarray,
+    ) -> float:
+        if predicted_xy is None:
+            return 0.0
+        sigma_px = max(float(self.sigma), 1.0)
+        dist_px = float(np.linalg.norm(predicted_xy - observed_xy))
+        return float(np.exp(-0.5 * (dist_px / sigma_px) ** 2))
+
+    def _canonical_center_offset_m(self, class_name: str) -> float:
+        return float(_CANONICAL_CENTER_OFFSET_M[class_name])
+
+    def _pose_z_axis(self, pose: dict) -> np.ndarray:
+        rvec = np.array(pose["rvec"], dtype=np.float64).reshape(3, 1)
+        tvec = np.array(pose["tvec_m"], dtype=np.float64)
+        R, _ = cv2.Rodrigues(rvec)
+        z_axis = R[:, 2].astype(np.float64)
+        z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-12)
+        if float(np.dot(z_axis, tvec)) < 0.0:
+            z_axis = -z_axis
+        return z_axis
+
+    def _solve_for(
+        self,
+        det: dict,
+        center_xy: Optional[np.ndarray] = None,
+        include_center: bool = True,
+    ) -> Optional[dict]:
         obj = build_object_keypoints(det["class_id"])
         img = det["kpts_xy"].copy()
-        img[0] = center_xy
+        if center_xy is not None:
+            img[0] = center_xy
         valid = det["kpts_conf"] >= self.kp_conf
-        valid[0] = True
+        valid[0] = bool(include_center)
         if valid.sum() < 4:
             return None
         return solve_pose(obj[valid], img[valid], self.K, self.dist)

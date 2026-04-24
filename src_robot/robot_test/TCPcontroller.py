@@ -2,18 +2,30 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from robot_test.hardware import HardwareInterface
 from robot_test.jacobian_solver import KinematicsSolver, ReachMode
-from robot_test.macro_micro import DualSideController, FinishReason, SingleSideController
+from robot_test.macro_micro import (
+    ControlConfig,
+    DualSideController,
+    FinishReason,
+    SingleSideController,
+)
 
 
 class TCPcontroller:
-    """Top-level PBVS orchestrator that selects and drives worker controllers."""
+    """Top-level PBVS orchestrator that selects and drives worker controllers.
+
+    robot_main only needs this class: feed dual-pin targets via
+    :meth:`set_targets` (auto-classified via reachability) or force a
+    single-side run via :meth:`set_single_target`.
+    """
 
     FK_VERIFY_RETRIES = 1
 
-    def __init__(self, topik, cfg):
+    def __init__(self, topik, cfg: ControlConfig):
         self.topik = topik
         self.cfg = cfg
+        self.hw = HardwareInterface(topik, cfg)
         self.kin = KinematicsSolver(topik)
         self.single_ctrl = SingleSideController(topik, cfg)
         self.dual_ctrl = DualSideController(topik, cfg)
@@ -26,9 +38,12 @@ class TCPcontroller:
         self._seq_idx = 0
         self._verify_retry = 0
         self._active_side: Optional[str] = None
+        self._cartype: int = 0
         self._done = True
         self.q_cmd = np.zeros(7)
         self.q_cmd_cnt = [0] * 7
+
+    # ---- Target setup ----
 
     def set_targets(self, target_l: np.ndarray, target_r: np.ndarray,
                     cartype: int = 0) -> Tuple[ReachMode, dict]:
@@ -37,12 +52,14 @@ class TCPcontroller:
             'left': np.asarray(target_l[:2], dtype=float),
             'right': np.asarray(target_r[:2], dtype=float),
         }
-        self.mode, self.mode_info = self.kin.check_dual_reachability(
-            hw=self.dual_ctrl.hw,
+        c_target, d_target = self.kin.mode_decompose(self._targets['left'], self._targets['right'])
+        self._cartype = int(cartype)
+        self.mode, self.mode_info = self.kin.check_modal_reachability(
+            hw=self.hw,
             cfg=self.cfg,
-            target_l=self._targets['left'],
-            target_r=self._targets['right'],
-            cartype=cartype,
+            c_target=c_target,
+            d_target=d_target,
+            q_current=self.topik.qm.copy(),
         )
         self.finish_reason = FinishReason.SUCCESS
         self._seq_sides = []
@@ -52,18 +69,49 @@ class TCPcontroller:
         self._done = self.mode == ReachMode.UNREACHABLE
 
         if self.mode == ReachMode.BOTH:
-            self.dual_ctrl.set_targets(self._targets['left'], self._targets['right'], cartype)
+            self.dual_ctrl.set_modal_targets(
+                c_target=c_target,
+                d_target=d_target,
+                target_l=self._targets['left'],
+                target_r=self._targets['right'],
+                cartype=self._cartype,
+            )
         elif self.mode == ReachMode.SEQUENTIAL:
             self._seq_sides = ['left', 'right']
-            self._start_single_side(self._seq_sides[0], cartype)
+            self._start_single_side(self._seq_sides[0])
         elif self.mode == ReachMode.ONE_SIDE:
             side = self.mode_info['reachable_side']
             self._seq_sides = [side]
-            self._start_single_side(side, cartype)
+            self._start_single_side(side)
         else:
             self.finish_reason = FinishReason.FAILED_IK
 
         return self.mode, self.mode_info
+
+    def set_single_target(self, side: str, target_xy: np.ndarray,
+                          cartype: int = 0) -> Tuple[ReachMode, dict]:
+        """Force a single-side run (used by PbvsLTask / PbvsRTask).
+
+        Bypasses dual-pin reachability classification and routes directly
+        through the single-side worker as ``ReachMode.ONE_SIDE``.
+        """
+        if side not in ('left', 'right'):
+            raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+
+        target_xy = np.asarray(target_xy[:2], dtype=float)
+        self._targets = {side: target_xy}
+        self._cartype = int(cartype)
+        self.mode = ReachMode.ONE_SIDE
+        self.mode_info = {'reachable_side': side, 'forced': True}
+        self.finish_reason = FinishReason.SUCCESS
+        self._seq_sides = [side]
+        self._seq_idx = 0
+        self._verify_retry = 0
+        self._done = False
+        self._start_single_side(side)
+        return self.mode, self.mode_info
+
+    # ---- Step ----
 
     def step(self, world_raw_l: Optional[np.ndarray] = None,
              world_raw_r: Optional[np.ndarray] = None,
@@ -81,10 +129,7 @@ class TCPcontroller:
             return self.q_cmd_cnt
 
         if self.mode in (ReachMode.SEQUENTIAL, ReachMode.ONE_SIDE):
-            if self._active_side == 'left':
-                world_raw = world_raw_l
-            else:
-                world_raw = world_raw_r
+            world_raw = world_raw_l if self._active_side == 'left' else world_raw_r
             q_cnt = self.single_ctrl.step(world_raw=world_raw, current_c_pos=current_c_pos)
             self.q_cmd = self.single_ctrl.q_cmd.copy()
             self.q_cmd_cnt = list(q_cnt)
@@ -103,11 +148,13 @@ class TCPcontroller:
     def succeeded(self) -> bool:
         return self.is_done and self.finish_reason == FinishReason.SUCCESS
 
-    def _start_single_side(self, side: str, cartype: int):
+    # ---- Internal sequencing ----
+
+    def _start_single_side(self, side: str):
         self._active_side = side
         self._verify_retry = 0
         self._done = False
-        self.single_ctrl.set_target(self._targets[side], side=side, cartype=cartype)
+        self.single_ctrl.set_target(self._targets[side], side=side, cartype=self._cartype)
         self.q_cmd = self.single_ctrl.q_cmd.copy()
         self.q_cmd_cnt = list(self.single_ctrl.q_cmd_cnt)
 
@@ -117,9 +164,12 @@ class TCPcontroller:
 
     def _verify_dual_targets(self) -> Tuple[float, float]:
         pin_l, pin_r = self.kin.fk_dual(self.q_cmd)
-        err_l = float(np.linalg.norm(pin_l - self._targets['left']))
-        err_r = float(np.linalg.norm(pin_r - self._targets['right']))
-        return err_l, err_r
+        c_now, d_now = self.kin.mode_decompose(pin_l, pin_r)
+        c_target = self.dual_ctrl.current_c_target
+        d_target = self.dual_ctrl.current_d_target
+        err_c = float(np.linalg.norm(c_now - c_target))
+        err_d = float(np.linalg.norm(d_now - d_target))
+        return err_c, err_d
 
     def _handle_dual_completion(self):
         self.finish_reason = self.dual_ctrl.finish_reason
@@ -127,16 +177,21 @@ class TCPcontroller:
             self._done = True
             return
 
-        err_l, err_r = self._verify_dual_targets()
-        verify_tol = self.cfg.micro_threshold
-        if err_l <= verify_tol and err_r <= verify_tol:
+        err_c, err_d = self._verify_dual_targets()
+        if err_c <= self.cfg.micro_threshold and err_d <= self.cfg.diff_deadband:
             self._done = True
             return
         if self._verify_retry < self.FK_VERIFY_RETRIES:
             self._verify_retry += 1
-            print(f"[TCP VERIFY] Dual FK residual too large "
-                  f"(L={err_l*1000:.2f}mm, R={err_r*1000:.2f}mm). Retrying controller.")
-            self.dual_ctrl.set_targets(self._targets['left'], self._targets['right'], self.topik.cartype)
+            c_target = self.dual_ctrl.current_c_target
+            d_target = self.dual_ctrl.current_d_target
+            print(f"[TCP VERIFY] Dual modal residual too large "
+                  f"(|e_c|={err_c*1000:.2f}mm, |e_d|={err_d*1000:.2f}mm). Retrying controller.")
+            self.dual_ctrl.set_modal_targets(
+                c_target=c_target,
+                d_target=d_target,
+                cartype=self._cartype,
+            )
             self.finish_reason = FinishReason.SUCCESS
             self._done = False
         else:
@@ -156,7 +211,7 @@ class TCPcontroller:
         if err > verify_tol and self._verify_retry < self.FK_VERIFY_RETRIES:
             self._verify_retry += 1
             print(f"[TCP VERIFY] {side} FK residual {err*1000:.2f}mm. Retrying controller.")
-            self.single_ctrl.set_target(self._targets[side], side=side, cartype=self.topik.cartype)
+            self.single_ctrl.set_target(self._targets[side], side=side, cartype=self._cartype)
             return
         if err > verify_tol:
             self.finish_reason = FinishReason.FAILED_TIMEOUT
@@ -171,7 +226,4 @@ class TCPcontroller:
             return
 
         next_side = self._seq_sides[self._seq_idx]
-        self._start_single_side(next_side, self.topik.cartype)
-
-
-UnifiedHybridController = TCPcontroller
+        self._start_single_side(next_side)

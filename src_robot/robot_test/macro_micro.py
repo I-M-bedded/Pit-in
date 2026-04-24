@@ -28,7 +28,8 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from controller import ik
-from robot_test.jacobian_solver import KinematicsSolver
+from robot_test.hardware import HardwareInterface
+from robot_test.jacobian_solver import SIDE_CFG, KinematicsSolver
 
 
 # =============================================================================
@@ -51,37 +52,6 @@ class FinishReason(Enum):
     FAILED_TIMEOUT = auto()
     FAILED_VARIANCE = auto()
     FAILED_VISION = auto()
-
-
-# Side-dependent configuration for Left / Right pin
-SIDE_CFG = {
-    'left': {
-        'fk_idx': 0,                # topik.x[0] = Left pin
-        'wing_joint': 3,            # qm[3] = Lr
-        'z_motor': 5,               # qm[5] = Lz
-        'jac_rows': (0, 1),         # J rows: d(Lx)/dq, d(Ly)/dq
-        'jac_cols': [0, 1, 2, 3],   # stage X, Y + rtZ + Lr
-        'so3_attr': 'so3_lcam',
-        'cam_mount_R': np.array([[ 0.0,  1.0, 0.0],    # rot_Z(-90)
-                                  [-1.0,  0.0, 0.0],
-                                  [ 0.0,  0.0, 1.0]]),
-        'cam_offset': np.array([-0.057, 0.029, 0.0]),
-        'ik_sign': -1,              # d2, d3 extend in -cos direction
-    },
-    'right': {
-        'fk_idx': 1,                # topik.x[1] = Right pin
-        'wing_joint': 4,            # qm[4] = Rr
-        'z_motor': 6,               # qm[6] = Rz
-        'jac_rows': (2, 3),         # J rows: d(Rx)/dq, d(Ry)/dq
-        'jac_cols': [0, 1, 2, 4],   # stage X, Y + rtZ + Rr
-        'so3_attr': 'so3_rcam',
-        'cam_mount_R': np.array([[ 0.0, -1.0, 0.0],    # rot_Z(+90)
-                                  [ 1.0,  0.0, 0.0],
-                                  [ 0.0,  0.0, 1.0]]),
-        'cam_offset': np.array([0.057, -0.029, 0.0]),
-        'ik_sign': +1,              # d2, d3 extend in +cos direction
-    },
-}
 
 
 @dataclass
@@ -120,13 +90,14 @@ class ControlConfig:
     # Stage travel limit from home (meter)
     stage_limit: float = 0.075          # 7.5 cm
 
-    # Weight matrix diagonal: [stageX, stageY, arm_rtZ, arm_wing]
-    # Large penalty on arm -> stage preferred
-    w_arm:   float = 1000.0
-    w_stage: float = 1.0
-
     # EMA filter coefficient for vision noise (0 < alpha <= 1, smaller = more smooth)
     ema_alpha: float = 0.3
+    diff_ema_alpha: float = 0.1
+
+    # Dual-pin modal control thresholds
+    diff_deadband: float = 0.0015
+    q2_search_range: float = np.pi / 6.0
+    q2_search_steps: int = 25
 
     # Joint velocity limits (rad/s for arm, m/s for stage)
     max_arm_vel:   float = 0.5    # rad/s
@@ -237,10 +208,6 @@ class SingleSideController:
         # once, right after the arm settles, and keeps following only that.
         self.macro_target_xy = np.zeros(2)
         self.micro_target_xy: Optional[np.ndarray] = None
-
-        # Weight diagonal: [stageX, stageY, rtZ, wing]
-        self.W_diag = np.array([cfg.w_stage, cfg.w_stage,
-                                cfg.w_arm,   cfg.w_arm])
 
     @property
     def _wing_idx(self) -> int:
@@ -611,104 +578,16 @@ class SingleSideController:
         return self.state == State.DONE
 
 
-# =============================================================================
-# Module D: HardwareInterface
-# =============================================================================
-class HardwareInterface:
-    """Interface between low-level PBVS workers and physical servo motors.
-    
-    Converts q_cmd (radian, meter) -> encoder count commands
-    and manages motor profile settings for real-time tracking.
-    """
-
-    def __init__(self, topik: ik.Topik, cfg: ControlConfig):
-        self.topik = topik
-        self.cfg = cfg
-        self.m2cnt = topik.m2cnt.copy()
-        self.cnt2m = topik.cnt2m.copy()
-
-    def q_to_cnt(self, q_cmd: np.ndarray) -> List[int]:
-        """Convert joint-space command to encoder counts.
-        
-        Args:
-            q_cmd: (7,) [trY(m), trX(m), rtZ(rad), Lr(rad), Rr(rad), Lz(m), Rz(m)]
-        
-        Returns:
-            cnt: (7,) encoder count command
-        """
-        return [int(np.round(q_cmd[i] * self.m2cnt[i])) for i in range(7)]
-
-    def cnt_to_q(self, cnt: np.ndarray) -> np.ndarray:
-        """Convert encoder counts to joint-space values.
-        
-        Args:
-            cnt: (7,) encoder counts
-        
-        Returns:
-            q: (7,) in (m, rad)
-        """
-        return np.array([cnt[i] * self.cnt2m[i] for i in range(7)])
-
-    def get_velocity_profile(self, q_dot: np.ndarray) -> List[int]:
-        """Compute motor velocity commands from joint velocities.
-        
-        Args:
-            q_dot: (7,) joint velocities in (m/s, rad/s)
-        
-        Returns:
-            vel_cnt: (7,) velocity commands in cnt/s
-        """
-        vel = np.zeros(7)
-        for i in range(7):
-            vel[i] = abs(q_dot[i] * self.m2cnt[i])
-        
-        # Clamp to default velocities
-        for i in range(7):
-            vel[i] = min(vel[i], self.cfg.t_vel[i])
-            vel[i] = max(vel[i], 100)  # minimum velocity
-
-        return [int(v) for v in vel]
-
-    def apply_safety_limits(self, q_cmd: np.ndarray) -> np.ndarray:
-        """Apply joint-space safety limits.
-        
-        Args:
-            q_cmd: (7,) command in (m, rad)
-        
-        Returns:
-            q_safe: (7,) clamped command
-        """
-        q_safe = q_cmd.copy()
-
-        # Stage limits from home.
-        sl = self.cfg.stage_limit  # 0.07m = 7cm
-        q_safe[0] = np.clip(q_safe[0], -sl, sl)   # trY (X forward)
-        q_safe[1] = np.clip(q_safe[1], -sl, sl)    # trX (Y left)
-
-        # Base rotation limit.
-        q_safe[2] = np.clip(q_safe[2], -0.325, 0.065)    # rtZ
-
-        # Wing rotation limits.
-        q_safe[3] = np.clip(q_safe[3], -1.7, 1.025)      # Lr
-        q_safe[4] = np.clip(q_safe[4], -1.7, 1.318)      # Rr
-
-        # Pin height limits (always >= 0)
-        q_safe[5] = max(q_safe[5], 0.0)
-        q_safe[6] = max(q_safe[6], 0.0)
-
-        return q_safe
-
-
 class DualState(Enum):
-    MACRO_BOTH = auto()
+    MACRO_DIFF = auto()
     WAIT_MACRO = auto()
-    MICRO_BOTH = auto()
+    MICRO_COMMON = auto()
     WAIT_MICRO = auto()
     DONE = auto()
 
 
 class DualSideController:
-    """Dual-pin controller that generates motor commands from solver outputs."""
+    """Dual-pin controller with modal macro/micro decomposition."""
 
     VISION_TIMEOUT_CYCLES = 100
 
@@ -723,30 +602,45 @@ class DualSideController:
         self.q_cmd = np.zeros(7)
         self.q_cmd_cnt = [0] * 7
         self._measured_q = np.zeros(7)
+        self._have_measured_q = False
         self._settle_timer = 0.0
         self._vision_miss = 0
-        self._obs_buf_l: List[np.ndarray] = []
-        self._obs_buf_r: List[np.ndarray] = []
 
         self.target_l = np.zeros(2)
         self.target_r = np.zeros(2)
-        self.micro_target_l: Optional[np.ndarray] = None
-        self.micro_target_r: Optional[np.ndarray] = None
-
-        self.W_diag = np.array([cfg.w_stage, cfg.w_stage, cfg.w_arm, cfg.w_arm, cfg.w_arm])
+        self._c_target = np.zeros(2)
+        self._d_target = np.zeros(2)
+        self._c_latest_vision: Optional[np.ndarray] = None
+        self._d_latest_vision: Optional[np.ndarray] = None
+        self._vision_initialized = False
 
     def set_targets(self, target_l: np.ndarray, target_r: np.ndarray, cartype: int = 0):
-        self.target_l = np.asarray(target_l[:2], dtype=float)
-        self.target_r = np.asarray(target_r[:2], dtype=float)
-        self.micro_target_l = None
-        self.micro_target_r = None
+        c_target, d_target = self.kin.mode_decompose(target_l, target_r)
+        self.set_modal_targets(c_target, d_target, target_l=target_l, target_r=target_r, cartype=cartype)
+
+    def set_modal_targets(self, c_target: np.ndarray, d_target: np.ndarray,
+                          target_l: Optional[np.ndarray] = None,
+                          target_r: Optional[np.ndarray] = None,
+                          cartype: int = 0):
+        self._c_target = np.asarray(c_target[:2], dtype=float)
+        self._d_target = np.asarray(d_target[:2], dtype=float)
+        if target_l is None or target_r is None:
+            self.target_l, self.target_r = self.kin.mode_compose(self._c_target, self._d_target)
+        else:
+            self.target_l = np.asarray(target_l[:2], dtype=float)
+            self.target_r = np.asarray(target_r[:2], dtype=float)
         self.topik.cartype = cartype
-        self.state = DualState.MACRO_BOTH
+        self.state = DualState.MACRO_DIFF
         self.finish_reason = FinishReason.SUCCESS
         self._settle_timer = 0.0
         self._vision_miss = 0
-        self._obs_buf_l.clear()
-        self._obs_buf_r.clear()
+        self._c_latest_vision = self._c_target.copy()
+        self._d_latest_vision = self._d_target.copy()
+        self._vision_initialized = True
+        self._measured_q = self.topik.qm.copy()
+        self._have_measured_q = True
+        self.q_cmd = self.topik.qm.copy()
+        self.q_cmd_cnt = self._q_cmd_to_cnt()
 
     def step(self, world_raw_l: Optional[np.ndarray] = None,
              world_raw_r: Optional[np.ndarray] = None,
@@ -758,38 +652,30 @@ class DualSideController:
             self.topik.get_q(q_cnt)
             self.topik.fk()
             self._measured_q = self.topik.qm.copy()
+            self._have_measured_q = True
 
-        err_l = err_r = None
-        if self.state == DualState.MICRO_BOTH:
-            if world_raw_l is not None and world_raw_r is not None:
-                self._vision_miss = 0
-                if self.micro_target_l is None:
-                    self.micro_target_l = np.asarray(world_raw_l[:2], dtype=float)
-                    self.micro_target_r = np.asarray(world_raw_r[:2], dtype=float)
-                    print(f"  [LATCH] L=({self.micro_target_l[0]:.4f}, {self.micro_target_l[1]:.4f}), "
-                          f"R=({self.micro_target_r[0]:.4f}, {self.micro_target_r[1]:.4f})")
-                err_l = self._pin_error(0, self.micro_target_l)
-                err_r = self._pin_error(1, self.micro_target_r)
-            else:
-                self._vision_miss += 1
-                if self._vision_miss > self.VISION_TIMEOUT_CYCLES:
-                    missing = []
-                    if world_raw_l is None:
-                        missing.append('L')
-                    if world_raw_r is None:
-                        missing.append('R')
-                    print(f"  [VISION TIMEOUT] No dual-camera data for "
-                          f"{self._vision_miss} cycles. Missing: {missing}")
-                    self._finish(FinishReason.FAILED_VISION)
+        if world_raw_l is not None and world_raw_r is not None:
+            self._update_modal_vision(world_raw_l, world_raw_r)
+            self._vision_miss = 0
+        elif self.state in (DualState.MICRO_COMMON, DualState.WAIT_MICRO):
+            self._vision_miss += 1
+            if self._vision_miss > self.VISION_TIMEOUT_CYCLES:
+                missing = []
+                if world_raw_l is None:
+                    missing.append('L')
+                if world_raw_r is None:
+                    missing.append('R')
+                print(f"  [VISION TIMEOUT] No dual-camera data for "
+                      f"{self._vision_miss} cycles. Missing: {missing}")
+                self._finish(FinishReason.FAILED_VISION)
 
-        if self.state == DualState.MACRO_BOTH:
+        if self.state == DualState.MACRO_DIFF:
             self._step_macro()
         elif self.state == DualState.WAIT_MACRO:
             if actual_cnt is not None:
                 self._step_wait_macro(actual_cnt)
-        elif self.state == DualState.MICRO_BOTH:
-            if err_l is not None and err_r is not None:
-                self._step_micro(err_l, err_r)
+        elif self.state == DualState.MICRO_COMMON:
+            self._step_micro()
         elif self.state == DualState.WAIT_MICRO:
             if current_c_pos is not None:
                 self._step_wait_micro()
@@ -805,42 +691,82 @@ class DualSideController:
     def succeeded(self) -> bool:
         return self.is_done and self.finish_reason == FinishReason.SUCCESS
 
+    @property
+    def current_c_target(self) -> np.ndarray:
+        if self._c_latest_vision is not None:
+            return self._c_latest_vision.copy()
+        return self._c_target.copy()
+
+    @property
+    def current_d_target(self) -> np.ndarray:
+        if self._d_latest_vision is not None:
+            return self._d_latest_vision.copy()
+        return self._d_target.copy()
+
     def _finish(self, reason: FinishReason):
         self.finish_reason = reason
         self.state = DualState.DONE
 
-    def _pin_error(self, fk_idx: int, target_xy: np.ndarray) -> np.ndarray:
-        pin = np.array(self.topik.x[fk_idx][:2], dtype=float)
-        return np.asarray(target_xy, dtype=float) - pin
+    def _current_q(self) -> np.ndarray:
+        return self._measured_q.copy() if self._have_measured_q else self.q_cmd.copy()
+
+    def _compute_modal(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        return self.kin.modal_fk(np.asarray(q, dtype=float))
+
+    def _compute_c(self, q: np.ndarray) -> np.ndarray:
+        c_now, _ = self._compute_modal(q)
+        return c_now
+
+    def _compute_d(self, q: np.ndarray) -> np.ndarray:
+        _, d_now = self._compute_modal(q)
+        return d_now
+
+    def _update_modal_vision(self, world_raw_l: np.ndarray, world_raw_r: np.ndarray):
+        raw_c, raw_d = self.kin.mode_decompose(world_raw_l[:2], world_raw_r[:2])
+        if not self._vision_initialized:
+            self._c_latest_vision = raw_c.copy()
+            self._d_latest_vision = raw_d.copy()
+            self._vision_initialized = True
+        else:
+            self._c_latest_vision = (
+                self.cfg.ema_alpha * raw_c
+                + (1.0 - self.cfg.ema_alpha) * self._c_latest_vision
+            )
+            self._d_latest_vision = (
+                self.cfg.diff_ema_alpha * raw_d
+                + (1.0 - self.cfg.diff_ema_alpha) * self._d_latest_vision
+            )
+        self._c_target = self._c_latest_vision.copy()
 
     def _step_macro(self):
         print("\n" + "=" * 60)
-        print("[DUAL PHASE 1] MACRO_BOTH -Simultaneous IK")
+        print("[DUAL PHASE 1] MACRO_DIFF -Differential IK")
         print("=" * 60)
 
-        q_sol = None
-        branch_name = ""
-        for flip in (False, True):
-            q_sol = self.kin.try_dual_ik_branch(
-                self.hw, self.cfg,
-                self.target_l, self.target_r,
-                self.topik.cartype, flip,
-            )
-            if q_sol is not None:
-                branch_name = 'flipped' if flip else 'default'
-                break
+        if self._d_latest_vision is not None:
+            self._d_target = self._d_latest_vision.copy()
 
-        if q_sol is None:
-            print("  [ERROR] No feasible IK branch found.")
+        macro = self.kin.solve_macro_differential(
+            d_target=self._d_target,
+            q_current=self._current_q(),
+            hw=self.hw,
+            cfg=self.cfg,
+            c_target=self._c_latest_vision if self._c_latest_vision is not None else self._c_target,
+        )
+        if macro is None:
+            print("  [ERROR] No feasible differential IK solution found.")
             self._finish(FinishReason.FAILED_IK)
             return
 
-        pin_l, pin_r = self.kin.fk_dual(q_sol)
-        res_l = np.linalg.norm(self.target_l - pin_l)
-        res_r = np.linalg.norm(self.target_r - pin_r)
-        print(f"  Branch       : {branch_name}")
-        print(f"  L residual   : {res_l*1000:.2f} mm")
-        print(f"  R residual   : {res_r*1000:.2f} mm")
+        q_sol = macro['q_cmd'].copy()
+        c_sol, d_sol = self._compute_modal(q_sol)
+        print(f"  d_target     : ({self._d_target[0]:.4f}, {self._d_target[1]:.4f}) m")
+        print(f"  d_macro      : ({d_sol[0]:.4f}, {d_sol[1]:.4f}) m")
+        print(f"  Branch       : {macro['branch']}")
+        print(f"  rtZ          : {np.rad2deg(q_sol[2]):.2f} deg")
+        print(f"  Lr / Rr      : {np.rad2deg(q_sol[3]):.2f} / {np.rad2deg(q_sol[4]):.2f} deg")
+        print(f"  c_macro      : ({c_sol[0]:.4f}, {c_sol[1]:.4f}) m")
+        print(f"  |e_d|        : {macro['residual']*1000:.2f} mm")
 
         self.q_cmd = q_sol.copy()
         self.state = DualState.WAIT_MACRO
@@ -857,12 +783,8 @@ class DualSideController:
         self._settle_timer += self.cfg.dt
 
         if settled:
-            print(f"  [MACRO SETTLED] {self._settle_timer:.2f}s -> MICRO_BOTH")
-            self.state = DualState.MICRO_BOTH
-            self.micro_target_l = None
-            self.micro_target_r = None
-            self._obs_buf_l.clear()
-            self._obs_buf_r.clear()
+            print(f"  [MACRO SETTLED] {self._settle_timer:.2f}s -> MICRO_COMMON")
+            self.state = DualState.MICRO_COMMON
             self._settle_timer = 0.0
             self._vision_miss = 0
         elif self._settle_timer > self.cfg.settle_timeout:
@@ -870,52 +792,38 @@ class DualSideController:
             print(f"  [TIMEOUT] cnt errors: {errs}")
             self._finish(FinishReason.FAILED_TIMEOUT)
 
-    def _step_micro(self, err_l: np.ndarray, err_r: np.ndarray):
-        self._obs_buf_l.append(err_l.copy())
-        self._obs_buf_r.append(err_r.copy())
-        if len(self._obs_buf_l) < self.cfg.micro_obs_frames:
+    def _step_micro(self):
+        if self._c_latest_vision is None or self._d_latest_vision is None:
             return
 
-        mean_l = np.mean(self._obs_buf_l, axis=0)
-        mean_r = np.mean(self._obs_buf_r, axis=0)
-        max_std = max(
-            np.max(np.std(self._obs_buf_l, axis=0)),
-            np.max(np.std(self._obs_buf_r, axis=0)),
-        )
-        self._obs_buf_l.clear()
-        self._obs_buf_r.clear()
-
-        norm_l = float(np.linalg.norm(mean_l))
-        norm_r = float(np.linalg.norm(mean_r))
-        print(f"\n  [MICRO OBS] L={norm_l*1000:.2f}mm  R={norm_r*1000:.2f}mm  std={max_std*1000:.2f}mm")
-
-        if max_std > self.cfg.micro_std_limit:
-            print(f"  [ERROR] Variance {max_std*1000:.1f}mm > limit. Aborting.")
-            self._finish(FinishReason.FAILED_VARIANCE)
+        d_err = self._d_latest_vision - self._compute_d(self.q_cmd)
+        d_err_norm = float(np.linalg.norm(d_err))
+        if d_err_norm > self.cfg.diff_deadband:
+            print(f"  [DIFF GUARD] |e_d|={d_err_norm*1000:.2f}mm -> re-enter MACRO_DIFF")
+            self._d_target = self._d_latest_vision.copy()
+            self.state = DualState.MACRO_DIFF
             return
 
-        if norm_l < self.cfg.micro_threshold and norm_r < self.cfg.micro_threshold:
-            print(f"  [CONVERGED] L={norm_l*1000:.3f}mm  R={norm_r*1000:.3f}mm")
+        c_now = self._compute_c(self._current_q())
+        c_err = self._c_latest_vision - c_now
+        c_err_norm = float(np.linalg.norm(c_err))
+        print(f"\n  [MICRO COMMON] |e_c|={c_err_norm*1000:.2f}mm  |e_d|={d_err_norm*1000:.2f}mm")
+
+        if c_err_norm < self.cfg.micro_threshold:
             self._finish(FinishReason.SUCCESS)
             return
 
-        dt_obs = self.cfg.dt * self.cfg.micro_obs_frames
-        dq = self.kin.solve_dual_pbvs_step(
-            measured_q=self._measured_q.copy(),
-            mean_l=mean_l,
-            mean_r=mean_r,
-            W_diag=self.W_diag,
-            pbvs_lambda=self.cfg.pbvs_lambda,
-            max_stage_step=self.cfg.max_stage_vel * dt_obs,
-            max_arm_step=self.cfg.max_arm_vel * dt_obs,
-        )
+        stage_step = self.cfg.pbvs_lambda * c_err
+        max_step = self.cfg.max_stage_vel * self.cfg.dt
+        step_norm = float(np.linalg.norm(stage_step))
+        if step_norm > max_step > 0.0:
+            stage_step *= max_step / step_norm
 
-        self.q_cmd[:5] += dq
+        self.q_cmd[0] += stage_step[0]
+        self.q_cmd[1] -= stage_step[1]
         self.q_cmd = self.hw.apply_safety_limits(self.q_cmd)
 
-        print(f"  [MICRO MOVE] stage=({dq[0]*1000:.1f}, {dq[1]*1000:.1f})mm  "
-              f"rtZ={np.rad2deg(dq[2]):.2f}deg  Lr={np.rad2deg(dq[3]):.2f}deg  "
-              f"Rr={np.rad2deg(dq[4]):.2f}deg")
+        print(f"  [MICRO MOVE] dq_stage=({stage_step[0]*1000:.1f}, {stage_step[1]*1000:.1f})mm")
 
         self.state = DualState.WAIT_MICRO
         self._settle_timer = 0.0
@@ -923,18 +831,15 @@ class DualSideController:
     def _step_wait_micro(self):
         aq = self._measured_q
         err_s = max(abs(self.q_cmd[0] - aq[0]), abs(self.q_cmd[1] - aq[1]))
-        err_a = max(abs(self.q_cmd[i] - aq[i]) for i in range(2, 5))
         self._settle_timer += self.cfg.dt
 
-        if err_s < self.cfg.stage_settle_m and err_a < self.cfg.joint_settle_rad:
+        if err_s < self.cfg.stage_settle_m:
             if self._settle_timer >= 0.2:
-                self.state = DualState.MICRO_BOTH
-                self._obs_buf_l.clear()
-                self._obs_buf_r.clear()
+                self.state = DualState.MICRO_COMMON
                 self._settle_timer = 0.0
                 self._vision_miss = 0
         elif self._settle_timer > self.cfg.settle_timeout:
-            print(f"  [TIMEOUT] stage={err_s*1000:.1f}mm  arm={np.rad2deg(err_a):.2f}deg")
+            print(f"  [TIMEOUT] stage={err_s*1000:.1f}mm")
             self._finish(FinishReason.FAILED_TIMEOUT)
 
     def _q_cmd_to_cnt(self) -> list:

@@ -1,11 +1,18 @@
 import argparse
+import os
+import sys
 
 import numpy as np
 
+SCRIPT_DIR = os.path.dirname(__file__)
+if SCRIPT_DIR in sys.path:
+    sys.path.remove(SCRIPT_DIR)
+sys.path.insert(0, os.path.join(SCRIPT_DIR, '..'))
 from controller import ik
+from robot_test.hardware import HardwareInterface
 from robot_test.jacobian_solver import ReachMode
-from robot_test.macro_micro import ControlConfig, HardwareInterface, SingleSideController
-from robot_test.unified_controller import TCPcontroller
+from robot_test.macro_micro import ControlConfig, SingleSideController
+from robot_test.TCPcontroller import TCPcontroller
 
 
 def _run_side_sim(ctrl, hw, side, target_xy, max_iter=200, noise_std=0.0002):
@@ -140,38 +147,46 @@ def simulate_unified():
     print("=" * 60)
 
     cfg = ControlConfig(version=4)
+    cfg.micro_threshold = 0.0005
+    cfg.max_stage_vel = 0.02
+    cfg.diff_deadband = 0.001
     topik = ik.Topik(cfg.version)
     hw = HardwareInterface(topik, cfg)
 
-    home_l = topik.xo_arr[0][0][:2].copy()
-    home_r = topik.xo_arr[0][1][:2].copy()
-    offset = np.array([0.01, 0.005])
-    target_l = home_l + offset
-    target_r = home_r + offset
-    print(f"  Home L: {home_l}, Home R: {home_r}")
-    print(f"  Target L: {target_l}, Target R: {target_r}")
+    def q_to_cpos(q):
+        q_hw = q.copy()
+        q_hw[2] = -q_hw[2]
+        q_hw[3] = -q_hw[3]
+        q_hw[4] = -q_hw[4]
+        return [q_hw[i] * topik.m2cnt[i] for i in range(7)]
 
-    ctrl = TCPcontroller(topik, cfg)
-    mode, info = ctrl.set_targets(target_l, target_r, cartype=0)
-    print(f"\nReachability: {mode.name}")
-    for k, v in info.items():
-        print(f"  {k}: {v}")
+    def run_case(case_name, target_l, target_r, drift_start=None, drift_delta=None):
+        print(f"\n[CASE] {case_name}")
+        print(f"  Target L: {target_l}")
+        print(f"  Target R: {target_r}")
 
-    if mode == ReachMode.BOTH:
-        def q_to_cpos(q):
-            q_hw = q.copy()
-            q_hw[2] = -q_hw[2]
-            q_hw[3] = -q_hw[3]
-            q_hw[4] = -q_hw[4]
-            return [q_hw[i] * topik.m2cnt[i] for i in range(7)]
+        topik.qm = np.zeros(7)
+        topik.fk()
+        ctrl = TCPcontroller(topik, cfg)
+        mode, info = ctrl.set_targets(target_l, target_r, cartype=0)
+        print(f"  Reachability: {mode.name}")
+        for k, v in info.items():
+            print(f"    {k}: {v}")
+
+        if mode != ReachMode.BOTH:
+            return
 
         noise_std = 0.0002
-        for it in range(200):
+        for it in range(220):
             sim_cpos = q_to_cpos(ctrl.q_cmd)
             nl = np.random.randn(2) * noise_std
             nr = np.random.randn(2) * noise_std
-            wl = np.array([target_l[0] + nl[0], target_l[1] + nl[1], 0.0])
-            wr = np.array([target_r[0] + nr[0], target_r[1] + nr[1], 0.0])
+            drift = np.zeros(2)
+            if drift_start is not None and drift_delta is not None and it >= drift_start:
+                drift = np.asarray(drift_delta, dtype=float)
+
+            wl = np.array([target_l[0] + nl[0] - drift[0], target_l[1] + nl[1] - drift[1], 0.0])
+            wr = np.array([target_r[0] + nr[0] + drift[0], target_r[1] + nr[1] + drift[1], 0.0])
 
             ctrl.step(world_raw_l=wl, world_raw_r=wr, current_c_pos=np.array(sim_cpos))
             ctrl.q_cmd = hw.apply_safety_limits(ctrl.q_cmd)
@@ -185,22 +200,51 @@ def simulate_unified():
                 topik.fk()
                 pl = np.array(topik.x[0][:2])
                 pr = np.array(topik.x[1][:2])
-                print(f"  iter {it+1}: L_err={np.linalg.norm(pl - target_l)*1000:.2f}mm  "
-                      f"R_err={np.linalg.norm(pr - target_r)*1000:.2f}mm")
+                c_now, d_now = ctrl.kin.mode_decompose(pl, pr)
+                c_target_live = ctrl.dual_ctrl.current_c_target
+                d_target_live = ctrl.dual_ctrl.current_d_target
+                print(f"  iter {it+1}: |e_c|={np.linalg.norm(c_now - c_target_live)*1000:.2f}mm  "
+                      f"|e_d|={np.linalg.norm(d_now - d_target_live)*1000:.2f}mm")
 
         topik.qm = ctrl.q_cmd.copy()
         topik.fk()
         pl = np.array(topik.x[0][:2])
         pr = np.array(topik.x[1][:2])
-        print(f"\n  Final L: {pl}, err={np.linalg.norm(pl - target_l)*1000:.4f}mm")
-        print(f"  Final R: {pr}, err={np.linalg.norm(pr - target_r)*1000:.4f}mm")
+        c_now, d_now = ctrl.kin.mode_decompose(pl, pr)
+        c_target_live = ctrl.dual_ctrl.current_c_target
+        d_target_live = ctrl.dual_ctrl.current_d_target
+        c_target_nom, d_target_nom = ctrl.kin.mode_decompose(target_l, target_r)
+        print(f"  Final live  |e_c|={np.linalg.norm(c_now - c_target_live)*1000:.4f}mm")
+        print(f"  Final live  |e_d|={np.linalg.norm(d_now - d_target_live)*1000:.4f}mm")
+        print(f"  Final nominal |e_c|={np.linalg.norm(c_now - c_target_nom)*1000:.4f}mm")
+        print(f"  Final nominal |e_d|={np.linalg.norm(d_now - d_target_nom)*1000:.4f}mm")
 
-    elif mode == ReachMode.SEQUENTIAL:
-        print("\n  -> Would run individual controllers L then R.")
-    elif mode == ReachMode.ONE_SIDE:
-        print(f"\n  -> Only {info['reachable_side']} reachable.")
-    else:
-        print("\n  -> UNREACHABLE. Check targets.")
+    home_l = topik.xo_arr[0][0][:2].copy()
+    home_r = topik.xo_arr[0][1][:2].copy()
+    home_c = 0.5 * (home_l + home_r)
+    home_d = home_r - home_l
+    rot_deg = 2.0
+    rot = np.array([
+        [np.cos(np.deg2rad(rot_deg)), -np.sin(np.deg2rad(rot_deg))],
+        [np.sin(np.deg2rad(rot_deg)), np.cos(np.deg2rad(rot_deg))],
+    ])
+    common_offset = np.array([0.005, 0.002])
+    target_c = home_c + common_offset
+    target_d = rot @ home_d
+    target_l = target_c - 0.5 * target_d
+    target_r = target_c + 0.5 * target_d
+
+    print(f"  Home L: {home_l}, Home R: {home_r}")
+    print(f"  Rotated differential by {rot_deg:.1f} deg for asymmetric target.")
+
+    run_case("asymmetric_static", target_l, target_r)
+    run_case(
+        "asymmetric_with_diff_drift",
+        target_l,
+        target_r,
+        drift_start=6,
+        drift_delta=np.array([0.0020, -0.0012]),
+    )
 
     print("=" * 60)
 

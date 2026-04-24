@@ -14,6 +14,9 @@ try:
 except ImportError:
     pass
 
+from robot_test.jacobian_solver import ReachMode
+from robot_test.macro_micro import FinishReason
+
 try:
     import pyrealsense2 as rs
     from vision.dataset_gen.auto_annotator import AutoAnnotator, write_yolo_pose_label, MARKER_CENTERS, MIN_MARKERS_REQUIRED
@@ -445,25 +448,26 @@ class _PbvsBase(BaseTask):
     """Single-side Macro-Micro PBVS task base.
 
     Vision node publishes hole position in the robot world frame on /cam0
-    (left) / /cam1 (right).  We feed that world point straight into the
-    SingleSideController, so both ``target_xy`` and ``world_raw`` are
-    expressed in world coordinates with no pin/camera transforms here.
+    (left) / /cam1 (right). The orchestrator (TCPcontroller) is the single
+    entry point: we force ONE_SIDE mode via ``set_single_target`` so that
+    robot_main never touches the worker controllers directly.
     """
     SIDE: str = ''
 
     def __init__(self, robot):
         super().__init__(robot)
-        self.ctrl = robot.pbvs_side_ctrl
+        self.tcp_ctrl = robot.pbvs_tcp_ctrl
 
     def start(self):
-        if not self.is_active:
-            self.is_active = True
-            world_hole = self._get_world_hole(self.SIDE)
-            target_xy = world_hole[:2]
+        if self.is_active:
+            return
+        world_hole = self._get_world_hole(self.SIDE)
+        target_xy = world_hole[:2]
 
-            self.ctrl.set_target(target_xy, side=self.SIDE, cartype=self.robot.agv.cartype)
-            self.robot.t_action = [0] * 7
-            print(f"PBVS Task Started - {self.SIDE} pin (world target: {target_xy})")
+        self.tcp_ctrl.set_single_target(self.SIDE, target_xy, cartype=self.robot.agv.cartype)
+        self.is_active = True
+        self.robot.t_action = [0] * 7
+        print(f"PBVS Task Started - {self.SIDE} pin (world target: {target_xy})")
 
     def _get_world_hole(self, side):
         if side == 'left':
@@ -472,21 +476,30 @@ class _PbvsBase(BaseTask):
             return np.array(self.robot.agv.rcam_hole_pos, dtype=float)
 
     def run(self):
-        if not self.is_active: return
+        if not self.is_active:
+            return
 
         world_raw = self._get_world_hole(self.SIDE)
         c_pos = np.array(self.robot.c_pos, dtype=float)
 
-        q_cnt = self.ctrl.step(world_raw=world_raw, current_c_pos=c_pos)
+        if self.SIDE == 'left':
+            q_cnt = self.tcp_ctrl.step(world_raw_l=world_raw, current_c_pos=c_pos)
+        else:
+            q_cnt = self.tcp_ctrl.step(world_raw_r=world_raw, current_c_pos=c_pos)
 
         for i in range(7):
             self.robot.t_action[i] = 0
         for i in range(5):
             self.robot.t_pos[i] = q_cnt[i]
 
-        if self.ctrl.is_done:
-            print(f"PBVS {self.SIDE} pin Finished.")
-            self.robot.agv.op_state[0] = 255
+        if self.tcp_ctrl.is_done:
+            reason = self.tcp_ctrl.finish_reason
+            if reason == FinishReason.SUCCESS:
+                print(f"PBVS {self.SIDE} pin Finished.")
+                self.robot.agv.op_state[0] = 255
+            else:
+                print(f"PBVS {self.SIDE} pin FAILED ({reason.name}).")
+                self.robot.agv.op_state[0] = 254
             self.reset()
 
 
@@ -512,7 +525,6 @@ class PbvsBothTask(BaseTask):
     def start(self):
         if self.is_active:
             return
-        from robot_test.jacobian_solver import ReachMode
 
         target_l = np.array(self.robot.agv.lcam_hole_pos, dtype=float)
         target_r = np.array(self.robot.agv.rcam_hole_pos, dtype=float)
@@ -537,7 +549,6 @@ class PbvsBothTask(BaseTask):
     def run(self):
         if not self.is_active:
             return
-        from robot_test.macro_micro import FinishReason
 
         wl = np.array(self.robot.agv.lcam_hole_pos, dtype=float)
         wr = np.array(self.robot.agv.rcam_hole_pos, dtype=float)
