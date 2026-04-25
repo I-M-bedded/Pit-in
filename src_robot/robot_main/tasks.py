@@ -401,18 +401,27 @@ class VisionTask(BaseTask):
         # 1. Update robot state and forward kinematics.
         self.robot.topik.get_q(self.robot.c_pos)
         self.robot.topik.fk()
-        robot_yaw = self.robot.c_pos[3]*self.robot.topik.cnt2m[3]
         
         # 2. Assemble CSV header and robot pose.
-        # Store the robot center pose followed by up to two marker records.
+        # Store the matching pin pose followed by up to two marker records.
         header = [
             "robot_x", "robot_y", "robot_th",
             "m1_id", "m1_x", "m1_y", "m1_z", "m1_qx", "m1_qy", "m1_qz", "m1_qw",
             "m2_id", "m2_x", "m2_y", "m2_z", "m2_qx", "m2_qy", "m2_qz", "m2_qw",
         ]
         
-        center_x = (self.robot.topik.x[0][0] + self.robot.topik.x[1][0]) / 2.0
-        center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
+        pin_pose_by_cam = {
+            'cam0': (
+                self.robot.topik.x[0][0],
+                self.robot.topik.x[0][1],
+                self.robot.c_pos[3] * self.robot.topik.cnt2m[3],
+            ),
+            'cam1': (
+                self.robot.topik.x[1][0],
+                self.robot.topik.x[1][1],
+                self.robot.c_pos[4] * self.robot.topik.cnt2m[4],
+            ),
+        }
 
         detected = getattr(self.robot.agv, 'detected_markers', {})
         if not isinstance(detected, dict):
@@ -451,7 +460,8 @@ class VisionTask(BaseTask):
                 else:
                     marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 
-            row_data = [center_x, center_y, robot_yaw] + marker_data
+            pin_x, pin_y, pin_yaw = pin_pose_by_cam[cam_name]
+            row_data = [pin_x, pin_y, pin_yaw] + marker_data
             filename = os.path.join(calibration_dir, f"Calibration_data_{cam_name}.csv")
             file_exists = os.path.isfile(filename)
 
