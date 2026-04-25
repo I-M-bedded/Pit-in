@@ -55,15 +55,15 @@ except ImportError:
 
 # Camera mount rotation and offset per side (mirrored from macro_micro.py SIDE_CFG)
 _CAM_MOUNT_R = {
-    "left":  np.array([[ 0.0,  1.0, 0.0],   # rot_Z(-90): camera → pin frame
-                        [-1.0,  0.0, 0.0],
-                        [ 0.0,  0.0, 1.0]], dtype=np.float64),
+    "left":  np.array([[ 0.0246, 0.9996,  0.0028],
+                        [ -0.9998, -0.0243, -0.0143],
+                        [ 0.0142,  0.0031,  0.9999]], dtype=np.float64),
     "right": np.array([[ 0.0, -1.0, 0.0],   # rot_Z(+90): camera → pin frame
                         [ 1.0,  0.0, 0.0],
                         [ 0.0,  0.0, 1.0]], dtype=np.float64),
 }
 _CAM_OFFSET = {           # camera optical center in pin frame [m]
-    "left":  np.array([-0.057,  0.029, 0.0], dtype=np.float64),
+    "left":  np.array([-0.0555,  0.0307, 0.0], dtype=np.float64),
     "right": np.array([ 0.057, -0.029, 0.0], dtype=np.float64),
 }
 
@@ -83,6 +83,28 @@ def _export_trt_engine(weights_path: str, imgsz: int, half: bool) -> str:
     return str(out)
 
 
+def _device_info(device) -> str:
+    """Return a compact RealSense device label for logs."""
+    fields = []
+    for label, info in (
+        ("name", rs.camera_info.name),
+        ("serial", rs.camera_info.serial_number),
+        ("product_line", rs.camera_info.product_line),
+        ("usb", rs.camera_info.usb_type_descriptor),
+    ):
+        try:
+            fields.append(f"{label}={device.get_info(info)}")
+        except Exception:
+            pass
+    return ", ".join(fields) if fields else "<unknown RealSense device>"
+
+
+def _list_realsense_devices() -> list[str]:
+    """Return labels for connected RealSense devices."""
+    ctx = rs.context()
+    return [_device_info(dev) for dev in ctx.query_devices()]
+
+
 class VisionNode(Node):
     """RealSense (RGB only) → HolePoseEstimator → WorldTracker → /cam0 Point."""
 
@@ -95,14 +117,16 @@ class VisionNode(Node):
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        serial: Optional[str] = None,
         show_gui: bool = True,
         half: bool = False,
         hz: float = 15.0,
         robot_version: int = 4,
         debug: bool = False,
     ):
-        super().__init__("vision_node")
+        super().__init__(f"vision_node_{side}")
         self.side = side
+        self.serial = serial
         self.show_gui = show_gui
         self.debug = debug
         self._warned_missing_world_fk = False
@@ -110,13 +134,25 @@ class VisionNode(Node):
         # -- RealSense: color only (depth removed, not used) --
         self.rs_pipeline = rs.pipeline()
         rs_config = rs.config()
+        if serial:
+            rs_config.enable_device(serial)
         rs_config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
         try:
-            self.rs_pipeline.start(rs_config)
-            self.get_logger().info("RealSense connected (color only).")
+            profile = self.rs_pipeline.start(rs_config)
+            device = profile.get_device()
+            self.get_logger().info(
+                f"RealSense connected for side={side} ({_device_info(device)})."
+            )
         except Exception as e:
             self.get_logger().error(f"RealSense init failed: {e}")
+            devices = _list_realsense_devices()
+            if devices:
+                self.get_logger().error(
+                    "Connected RealSense devices: " + " | ".join(devices)
+                )
+            else:
+                self.get_logger().error("No RealSense devices were detected.")
             self.rs_pipeline = None
             return
 
@@ -319,7 +355,7 @@ class VisionNode(Node):
         # 5. GUI
         if self.show_gui:
             vis = self._draw_overlay(color_image, result, world_est)
-            cv2.imshow("Vision Node", vis)
+            cv2.imshow(f"Vision Node {self.side}", vis)
             cv2.waitKey(1)
 
     # ------------------------------------------------------------------
@@ -424,6 +460,10 @@ def main():
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--hz", type=float, default=15.0)
+    ap.add_argument("--serial", type=str, default=None,
+                    help="RealSense serial number to bind to this side")
+    ap.add_argument("--list-cameras", action="store_true",
+                    help="Print connected RealSense devices and exit")
     ap.add_argument("--half", action="store_true",
                     help="FP16 inference — Tensor Core acceleration on AGX Orin")
     ap.add_argument("--trt", action="store_true",
@@ -433,6 +473,14 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="Per-frame detection log + richer GUI overlay")
     args = ap.parse_args()
+
+    if args.list_cameras:
+        devices = _list_realsense_devices()
+        if not devices:
+            print("No RealSense devices detected.")
+        for dev in devices:
+            print(dev)
+        return
 
     weights = args.weights
     if args.trt and weights.endswith(".pt"):
@@ -447,6 +495,7 @@ def main():
         width=args.width,
         height=args.height,
         fps=args.fps,
+        serial=args.serial,
         show_gui=not args.no_gui,
         half=args.half,
         hz=args.hz,

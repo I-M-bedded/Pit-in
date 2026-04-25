@@ -403,24 +403,7 @@ class VisionTask(BaseTask):
         self.robot.topik.fk()
         robot_yaw = self.robot.c_pos[3]*self.robot.topik.cnt2m[3]
         
-        # 2. Load the currently detected markers.
-        # {id: {'x':.., 'y':.., 'z':.., 'qx':.., 'qy':.., 'qz':.., 'qw':.., 'stamp':..}}
-        markers = self.robot.agv.detected_markers
-        sorted_ids = sorted(markers.keys())
-        
-        # 3. Build a fixed-width marker record for up to two markers.
-        marker_data = []
-        for i in range(2):
-            if i < len(sorted_ids):
-                m_id = sorted_ids[i]
-                m_info = markers[m_id]
-                marker_data += [m_id, m_info['x'], m_info['y'], m_info['z'], 
-                                m_info['qx'], m_info['qy'], m_info['qz'], m_info['qw']]
-            else:
-                # Pad missing marker slots with neutral values.
-                marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-
-        # 4. Assemble CSV header and row data.
+        # 2. Assemble CSV header and robot pose.
         # Store the robot center pose followed by up to two marker records.
         header = [
             "robot_x", "robot_y", "robot_th",
@@ -430,19 +413,59 @@ class VisionTask(BaseTask):
         
         center_x = (self.robot.topik.x[0][0] + self.robot.topik.x[1][0]) / 2.0
         center_y = (self.robot.topik.x[0][1] + self.robot.topik.x[1][1]) / 2.0
-        row_data = [center_x, center_y] + [robot_yaw]+ marker_data
 
-        # 5. Append to the calibration CSV file.
-        filename = "Calibration_data.csv"
-        file_exists = os.path.isfile(filename)
+        detected = getattr(self.robot.agv, 'detected_markers', {})
+        if not isinstance(detected, dict):
+            detected = {}
 
-        with open(filename, 'a', newline='') as file:
-            writer = csv.writer(file)
-            if not file_exists or os.path.getsize(filename) == 0:
-                writer.writerow(header)
-            writer.writerow(row_data)
+        # New ROS marker cache is nested by camera: {'cam0': {id: pose}, 'cam1': {id: pose}}.
+        # Keep a tiny fallback for older flat caches so existing manual runs do not crash.
+        cam_marker_sets = {
+            'cam0': detected.get('cam0', {}) if isinstance(detected.get('cam0', {}), dict) else {},
+            'cam1': detected.get('cam1', {}) if isinstance(detected.get('cam1', {}), dict) else {},
+        }
+        flat_markers = {
+            k: v for k, v in detected.items()
+            if isinstance(k, int) and isinstance(v, dict)
+        }
+        if flat_markers and not cam_marker_sets['cam0']:
+            cam_marker_sets['cam0'] = flat_markers
 
-        print(f"[SUCCESS] Calibration data saved. Detected Markers: {sorted_ids}")
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        calibration_dir = os.path.join(repo_root, "vision", "calibration")
+        os.makedirs(calibration_dir, exist_ok=True)
+
+        saved = []
+        for cam_name, markers in cam_marker_sets.items():
+            sorted_ids = sorted(markers.keys())
+            if not sorted_ids:
+                continue
+
+            marker_data = []
+            for i in range(2):
+                if i < len(sorted_ids):
+                    m_id = sorted_ids[i]
+                    m_info = markers[m_id]
+                    marker_data += [m_id, m_info['x'], m_info['y'], m_info['z'],
+                                    m_info['qx'], m_info['qy'], m_info['qz'], m_info['qw']]
+                else:
+                    marker_data += ["N/A", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+            row_data = [center_x, center_y, robot_yaw] + marker_data
+            filename = os.path.join(calibration_dir, f"Calibration_data_{cam_name}.csv")
+            file_exists = os.path.isfile(filename)
+
+            with open(filename, 'a', newline='') as file:
+                writer = csv.writer(file)
+                if not file_exists or os.path.getsize(filename) == 0:
+                    writer.writerow(header)
+                writer.writerow(row_data)
+            saved.append(f"{cam_name}:{sorted_ids}")
+
+        if saved:
+            print(f"[SUCCESS] Calibration data saved. {', '.join(saved)}")
+        else:
+            print("[WARN] Calibration data not saved: no cam0/cam1 markers detected.")
 
 class _PbvsBase(BaseTask):
     """Single-side Macro-Micro PBVS task base.

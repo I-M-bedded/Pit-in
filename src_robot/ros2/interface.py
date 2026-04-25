@@ -24,8 +24,10 @@ class SrvreqSubscriber(Node):
 
         # 동적 마커 구독 관리
         self.marker_subscriptions = {}
-        if not hasattr(self.agv, 'detected_markers'):
+        if not hasattr(self.agv, 'detected_markers') or not isinstance(self.agv.detected_markers, dict):
             self.agv.detected_markers = {}
+        self.agv.detected_markers.setdefault('cam0', {})
+        self.agv.detected_markers.setdefault('cam1', {})
 
         # server_req topic listener
         self.subscription = self.create_subscription(
@@ -68,7 +70,11 @@ class SrvreqSubscriber(Node):
         topic_names_and_types = self.get_topic_names_and_types()
 
         for topic_name, topic_types in topic_names_and_types:
-            if '/cam0/marker_' in topic_name and 'geometry_msgs/msg/PoseStamped' in topic_types:
+            is_marker_topic = (
+                ('/cam0/marker_' in topic_name or '/cam1/marker_' in topic_name)
+                and 'geometry_msgs/msg/PoseStamped' in topic_types
+            )
+            if is_marker_topic:
                 if topic_name not in self.marker_subscriptions:
                     self.get_logger().info(f'Found new marker topic: {topic_name}. Subscribing...')
                     sub = self.create_subscription(
@@ -81,8 +87,10 @@ class SrvreqSubscriber(Node):
 
     def marker_callback(self, msg, topic_name):
         try:
+            cam_name = topic_name.strip('/').split('/')[0]
             marker_id = int(topic_name.split('_')[-1])
-            self.agv.detected_markers[marker_id] = {
+            self.agv.detected_markers.setdefault(cam_name, {})
+            self.agv.detected_markers[cam_name][marker_id] = {
                 'x': msg.pose.position.x,
                 'y': msg.pose.position.y,
                 'z': msg.pose.position.z,
@@ -90,7 +98,8 @@ class SrvreqSubscriber(Node):
                 'qy': msg.pose.orientation.y,
                 'qz': msg.pose.orientation.z,
                 'qw': msg.pose.orientation.w,
-                'stamp': msg.header.stamp
+                'stamp': msg.header.stamp,
+                'topic': topic_name,
             }
         except Exception as e:
             self.get_logger().error(f'Error in marker_callback: {e}')

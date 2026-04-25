@@ -128,7 +128,7 @@ class robot:
         rif.rclpy.init(args=None)
         self.ros = rif.SrvreqSubscriber(self.agv, self.servo_states)
         self.thereadcheck[0] = 1
-        print("[ROS2 THREAD] Successfully spinning SrvreqSubscriber node! Subscribed to /cam0")
+        print("[ROS2 THREAD] Successfully spinning SrvreqSubscriber node! Subscribed to /cam0 and /cam1")
         try:
             rif.rclpy.spin(self.ros)
         finally:
