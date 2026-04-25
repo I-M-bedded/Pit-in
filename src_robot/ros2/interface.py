@@ -229,8 +229,10 @@ class SrvreqSubscriber(Node):
         msg.lift_height = self.agv.lift_height
         msg.driving_state = self.agv.driving_state
         msg.lift_state = self.agv.lift_state_ros
-        msg.t_pos = self.agv.t_pos
-        msg.c_pos = self.agv.c_pos
+        # Top-plate monitoring must reflect the real servo loop, not the
+        # leadshine AGV dummy's station t_pos/c_pos placeholders.
+        msg.t_pos = list(self.servoState.topplate_tpos)
+        msg.c_pos = list(self.servoState.topplate_cpos)
         msg.stamp = self.get_clock().now().to_msg()
         msg.estop = self.agv.estop
         msg.error_a = self.agv.error

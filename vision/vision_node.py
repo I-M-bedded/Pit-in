@@ -38,7 +38,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Point
 
 from hole_pose_estimator import CLASS_ID_TO_NAME, HolePoseEstimator
-from world_tracker import WorldTracker
+from world_tracker import WorldEstimate, WorldTracker
 
 try:
     from pitin_msgs.msg import JointState as PitinJointState
@@ -58,13 +58,13 @@ _CAM_MOUNT_R = {
     "left":  np.array([[ 0.0246, 0.9996,  0.0028],
                         [ -0.9998, -0.0243, -0.0143],
                         [ 0.0142,  0.0031,  0.9999]], dtype=np.float64),
-    "right": np.array([[ 0.0, -1.0, 0.0],   # rot_Z(+90): camera → pin frame
-                        [ 1.0,  0.0, 0.0],
+    "right": np.array([[ 0.0, 1.0, 0.0],   # rot_Z(-90): camera → pin frame
+                        [ -1.0,  0.0, 0.0],
                         [ 0.0,  0.0, 1.0]], dtype=np.float64),
 }
 _CAM_OFFSET = {           # camera optical center in pin frame [m]
     "left":  np.array([-0.0555,  0.0307, 0.0], dtype=np.float64),
-    "right": np.array([ 0.057, -0.029, 0.0], dtype=np.float64),
+    "right": np.array([ 0.0555, 0.0307, 0.0], dtype=np.float64),
 }
 
 
@@ -140,9 +140,9 @@ class VisionNode(Node):
 
         try:
             profile = self.rs_pipeline.start(rs_config)
-            device = profile.get_device()
+            rs_device = profile.get_device()
             self.get_logger().info(
-                f"RealSense connected for side={side} ({_device_info(device)})."
+                f"RealSense connected for side={side} ({_device_info(rs_device)})."
             )
         except Exception as e:
             self.get_logger().error(f"RealSense init failed: {e}")
@@ -326,7 +326,14 @@ class VisionNode(Node):
         )
 
         # 4. World-space EMA (ambiguity resolution + temporal filter)
-        world_est = self.tracker.update(result, cam_to_world, cam_origin)
+        # Do not feed camera-frame fallback coordinates into the world-frame
+        # tracker. Otherwise a pre-FK camera tvec can later be reused as a
+        # world prior and pull the EMA/line ambiguity resolver to nonsense.
+        if self._has_world_frame():
+            world_est = self.tracker.update(result, cam_to_world, cam_origin)
+        else:
+            self.tracker.reset()
+            world_est = WorldEstimate(source=result.source)
 
         # 5. Publish only valid world-frame points.
         #    When FK is not ready, WorldTracker is in camera-space fallback mode,
