@@ -19,6 +19,7 @@ class SrvreqSubscriber(Node):
         self.agv_res = 'agv_res_ver1'
         self.agv_monitoring = 'agv_monitoring_ver1'
         self.joint_state = 'agv_joint_state'
+        self.joint_target_state = 'agv_joint_target_state'
         self.lcam = 'cam0'
         self.rcam = 'cam1'
 
@@ -59,6 +60,7 @@ class SrvreqSubscriber(Node):
         self.publisher_ = self.create_publisher(Amonitoring, self.agv_monitoring, 10)
         self.publisher2_ = self.create_publisher(Agvop, self.agv_res, 10)
         self.publisher3_ = self.create_publisher(JointState, self.joint_state, 10)
+        self.publisher4_ = self.create_publisher(JointState, self.joint_target_state, 10)
 
         # timers
         self.timer_monitor = self.create_timer(amonitor_period, self.agvmonitoring_callback)
@@ -229,10 +231,8 @@ class SrvreqSubscriber(Node):
         msg.lift_height = self.agv.lift_height
         msg.driving_state = self.agv.driving_state
         msg.lift_state = self.agv.lift_state_ros
-        # Top-plate monitoring must reflect the real servo loop, not the
-        # leadshine AGV dummy's station t_pos/c_pos placeholders.
-        msg.t_pos = list(self.servoState.topplate_tpos)
-        msg.c_pos = list(self.servoState.topplate_cpos)
+        msg.t_pos = self.agv.t_pos
+        msg.c_pos = self.agv.c_pos
         msg.stamp = self.get_clock().now().to_msg()
         msg.estop = self.agv.estop
         msg.error_a = self.agv.error
@@ -254,18 +254,22 @@ class SrvreqSubscriber(Node):
                 self.agv.op_state[0] = 0
 
     def agv_joint_update(self):
+        self.publisher3_.publish(self._topplate_joint_msg(self.servoState.topplate_cpos))
+        self.publisher4_.publish(self._topplate_joint_msg(self.servoState.topplate_tpos))
+
+    def _topplate_joint_msg(self, pos):
         msg = JointState()
-        msg.x_pos = self.servoState.topplate_cpos[1]
-        msg.y_pos = self.servoState.topplate_cpos[0]
-        msg.yaw_pos = self.servoState.topplate_cpos[2]
-        msg.lpin_pos = self.servoState.topplate_cpos[5]
-        msg.lpin_rotate = self.servoState.topplate_cpos[3]
-        msg.rpin_pos = self.servoState.topplate_cpos[6]
-        msg.rpin_rotate = self.servoState.topplate_cpos[4]
+        msg.x_pos = pos[1]
+        msg.y_pos = pos[0]
+        msg.yaw_pos = pos[2]
+        msg.lpin_pos = pos[5]
+        msg.lpin_rotate = pos[3]
+        msg.rpin_pos = pos[6]
+        msg.rpin_rotate = pos[4]
         msg.lift_height = 0.0
         msg.lw_vel = 0.0
         msg.rw_vel = 0.0
-        self.publisher3_.publish(msg)
+        return msg
 
     def lcam_listener_callback(self, msg):
         self.agv.lcam_hole_pos[0] = msg.x
