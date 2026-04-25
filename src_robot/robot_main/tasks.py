@@ -294,7 +294,17 @@ class VisionTask(BaseTask):
         if inputs['L'] and not inputs['R']:
             self.robot.topik.get_q(self.robot.c_pos)
             self.robot.topik.fk()
-            print("FK Check:", self.robot.topik.x[0][0], self.robot.topik.x[0][1], self.robot.agv.lcam_hole_pos)
+            lpin = np.asarray(self.robot.topik.x[0], dtype=float).reshape(-1)
+            rpin = np.asarray(self.robot.topik.x[1], dtype=float).reshape(-1)
+            lcam = np.asarray(self.robot.agv.lcam_hole_pos, dtype=float).reshape(-1)
+            rcam = np.asarray(self.robot.agv.rcam_hole_pos, dtype=float).reshape(-1)
+            print(
+                "[FK Check] "
+                f"Lpin={np.round(lpin, 6).tolist()}  "
+                f"Rpin={np.round(rpin, 6).tolist()}  "
+                f"Lcam(/cam0)={np.round(lcam, 6).tolist()}  "
+                f"Rcam(/cam1)={np.round(rcam, 6).tolist()}"
+            )
     
     def save_annotation(self):
         """L + R trigger: Capture current frame and save YOLO Pose annotation."""
