@@ -635,23 +635,6 @@ class fastech:
                     try: self.servo_reset()
                     except: print(f"bad comm state for reset {self.id}")
         
-        if self.id == 2 and self.com_apos != self.desired_pos and (not self.can_move_command or not self.can_move):
-            key = (
-                self.com_apos, self.desired_pos, self.can_move_command, self.can_move,
-                self.estop, self.error, self.error_code, self.is_alarm, self.servo_state,
-                self.is_stop, self.is_originfinding, self.is_originfinding_ok,
-            )
-            if getattr(self, "_last_yaw_block_debug", None) != key:
-                print(
-                    "[rtZ DEBUG] move blocked "
-                    f"c={self.com_apos} t={self.desired_pos} "
-                    f"can_cmd={self.can_move_command} can={self.can_move} "
-                    f"estop={self.estop} err={self.error} ec={self.error_code} "
-                    f"alarm={self.is_alarm} servo={self.servo_state} stop={self.is_stop} "
-                    f"originfinding={self.is_originfinding} origin_ok={self.is_originfinding_ok}"
-                )
-                self._last_yaw_block_debug = key
-
         if self.can_move_command and self.can_move:
             if self.servo_state==0 and self.desired_action==2:    
                 try :self.servo_on()
@@ -669,25 +652,8 @@ class fastech:
                         if self.com_apos==self.desired_pos:
                             pass
                         else:
-                            try:
-                                result = self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
-                                if self.id == 2:
-                                    key = (
-                                        self.com_apos, self.desired_pos, int(self.desired_vel),
-                                        result, self.commstate, self.error, self.error_code,
-                                        self.pLimit, self.nLimit, self.pSlim, self.nSlim,
-                                        self.is_inposition, self.is_moving, self.servo_state,
-                                    )
-                                    if getattr(self, "_last_yaw_move_debug", None) != key:
-                                        print(
-                                            "[rtZ DEBUG] amove "
-                                            f"c={self.com_apos} t={self.desired_pos} v={int(self.desired_vel)} "
-                                            f"ret={result} comm={self.commstate} err={self.error} ec={self.error_code} "
-                                            f"pLimit={self.pLimit} nLimit={self.nLimit} "
-                                            f"pSlim={self.pSlim} nSlim={self.nSlim} "
-                                            f"inpos={self.is_inposition} moving={self.is_moving} servo={self.servo_state}"
-                                        )
-                                        self._last_yaw_move_debug = key
+                            try: 
+                                self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
                             except: print(f"bad comm state for set move {self.id}")
                 elif self.desired_action==4:
                     if self.desired_pos==self.com_apos:
