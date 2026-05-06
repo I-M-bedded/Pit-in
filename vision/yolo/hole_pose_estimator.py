@@ -403,6 +403,7 @@ class HolePoseEstimator:
 
     OUTER_AR_THRESHOLD = 1.3   # aspect-ratio gate for slot verification
     INNER_ALONE_CONF   = 0.8   # inner-only conic trigger in Case 2a
+    CONIC_CENTER_GATE_PX = 18.0
 
     def __init__(
         self,
@@ -547,13 +548,13 @@ class HolePoseEstimator:
         inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
         inner_radius = float(inner_spec["size"]) / 2.0
         pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
-        if pose is not None:
+        if pose is not None and self._is_conic_center_sane(inner, pose):
             center_xy = np.array(pose["corrected_xy"], dtype=np.float64)
             source = "conic"
         else:
-            # Graceful fallback when conic signature is degenerate.
+            # Graceful fallback when conic is degenerate or over-corrected.
             center_xy = ic.copy()
-            source = "ellipse"
+            source = "kp0"
             pose = self._solve_for(inner, center_xy)
         return CenterHoleResult(center_xy=center_xy, confidence=reliability,
                                 source=source, pose=pose)
@@ -583,12 +584,12 @@ class HolePoseEstimator:
             inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
             inner_radius = float(inner_spec["size"]) / 2.0
             pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
-            if pose is not None:
+            if pose is not None and self._is_conic_center_sane(inner, pose):
                 center = np.array(pose["corrected_xy"], dtype=np.float64)
                 source = "conic"
             else:
-                center = inner["ellipse"]["center_xy"].copy()
-                source = "ellipse"
+                center = inner["kp0_xy"].copy()
+                source = "kp0"
                 pose = self._solve_for(inner, center)
             return CenterHoleResult(center_xy=center, confidence=inner["conf"] * 0.8,
                                     source=source, pose=pose)
@@ -948,6 +949,17 @@ class HolePoseEstimator:
                         verified.append(c)
             cands = verified
         return max(cands, key=lambda d: d["conf"]) if cands else None
+
+    def _is_conic_center_sane(self, det: dict, pose: dict) -> bool:
+        """Reject conic corrections that jump too far from detector center."""
+        if pose is None or "corrected_xy" not in pose:
+            return False
+        corrected = np.array(pose["corrected_xy"], dtype=np.float64)
+        kp0 = np.array(det["kp0_xy"], dtype=np.float64)
+        if not np.all(np.isfinite(corrected)) or not np.all(np.isfinite(kp0)):
+            return False
+
+        return float(np.linalg.norm(corrected - kp0)) <= self.CONIC_CENTER_GATE_PX
 
     def _canonical_center_from_pose(
         self,
