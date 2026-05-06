@@ -51,6 +51,7 @@ class TopPlateSupervisor:
                     self.loading.start_approach()
                 elif (reqid == 0x131 and preset == 5) or (inputs['LT_PRESSED'] and inputs['X']):
                     self.loading.start_load()
+                    
             # [PBVS — L pin: LT+Y, R pin: RT+Y, Both: LT+RT]
             if inputs['LT_PRESSED'] and inputs['Y'] and not self.pbvs_r.is_active and not self.pbvs_both.is_active:
                 self.pbvs_l.start()

@@ -653,7 +653,19 @@ class fastech:
                             pass
                         else:
                             try: 
-                                self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
+                                move_result = self.servo_amove(self.desired_pos,abs(int(self.desired_vel)))
+                                if move_result != 0 and self.id == 2:
+                                    print(
+                                        f"rtZ move rejected: result={move_result}, "
+                                        f"resp={self.combit}, cmd={self.desired_pos}, "
+                                        f"apos={self.com_apos}, pos={self.pos}, vel={self.desired_vel}, "
+                                        f"servo={self.servo_state}, alarm={self.is_alarm}, "
+                                        f"error={self.error}, error_code={self.error_code}, "
+                                        f"pLimit={self.pLimit}, nLimit={self.nLimit}, "
+                                        f"pSlim={self.pSlim}, nSlim={self.nSlim}, "
+                                        f"inpos={self.is_inposition}, moving={self.is_moving}, "
+                                        f"stop={self.is_stop}"
+                                    )
                             except: print(f"bad comm state for set move {self.id}")
                 elif self.desired_action==4:
                     if self.desired_pos==self.com_apos:
