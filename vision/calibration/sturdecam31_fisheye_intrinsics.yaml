@@ -1,0 +1,77 @@
+%YAML:1.0
+---
+camera_model: opencv_fisheye
+image_width: 1920
+image_height: 1536
+board_cols: 9
+board_rows: 6
+square_size: 0.025000000000000001
+rms: 0.32269654143185011
+mean_reprojection_error_px: 0.32269654143185006
+K: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 870.50179804967797, 0., 929.93555955634417, 0.,
+       872.44041513561672, 781.13857292896012, 0., 0., 1. ]
+D: !!opencv-matrix
+   rows: 4
+   cols: 1
+   dt: d
+   data: [ -0.016951603398995974, -0.019265946313403687,
+       0.0073498684371172355, -0.0021413130760246177 ]
+K_undistort: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 609.45244117436005, 0., 864.69069728900649, 0.,
+       610.8096984691465, 790.62272739002435, 0., 0., 1. ]
+per_view_errors_px: !!opencv-matrix
+   rows: 33
+   cols: 1
+   dt: d
+   data: [ 0.21081321504231662, 0.23017967205605933, 0.23754044080156939,
+       0.22950556211563955, 0.27195309930326628, 0.20748367463528056,
+       0.25446705552559867, 0.43331607407205991, 0.24632986206613269,
+       0.25686699222310871, 0.26821373160379541, 0.29112501590749529,
+       0.22381666988911283, 0.25032936891449109, 0.28495808991362331,
+       1.1581951517910762, 0.20165814148570485, 0.25143520076213188,
+       0.2239857409092742, 0.20005035628799792, 0.19957161333050924,
+       0.31945528701186238, 0.22276960890414957, 0.19834455458720276,
+       0.1954698036930807, 0.19647349778389667, 0.32918952409669255,
+       0.41872991042524282, 0.20485932328006612, 0.19586455314779933,
+       0.21914507742073255, 0.21236239949074889, 0.28762834096958517 ]
+used_images:
+   - "./calibration/calib_img/guvcview_image-10.jpg"
+   - "./calibration/calib_img/guvcview_image-11.jpg"
+   - "./calibration/calib_img/guvcview_image-12.jpg"
+   - "./calibration/calib_img/guvcview_image-13.jpg"
+   - "./calibration/calib_img/guvcview_image-14.jpg"
+   - "./calibration/calib_img/guvcview_image-15.jpg"
+   - "./calibration/calib_img/guvcview_image-16.jpg"
+   - "./calibration/calib_img/guvcview_image-17.jpg"
+   - "./calibration/calib_img/guvcview_image-18.jpg"
+   - "./calibration/calib_img/guvcview_image-19.jpg"
+   - "./calibration/calib_img/guvcview_image-2.jpg"
+   - "./calibration/calib_img/guvcview_image-20.jpg"
+   - "./calibration/calib_img/guvcview_image-21.jpg"
+   - "./calibration/calib_img/guvcview_image-22.jpg"
+   - "./calibration/calib_img/guvcview_image-23.jpg"
+   - "./calibration/calib_img/guvcview_image-24.jpg"
+   - "./calibration/calib_img/guvcview_image-25.jpg"
+   - "./calibration/calib_img/guvcview_image-26.jpg"
+   - "./calibration/calib_img/guvcview_image-27.jpg"
+   - "./calibration/calib_img/guvcview_image-28.jpg"
+   - "./calibration/calib_img/guvcview_image-29.jpg"
+   - "./calibration/calib_img/guvcview_image-3.jpg"
+   - "./calibration/calib_img/guvcview_image-30.jpg"
+   - "./calibration/calib_img/guvcview_image-31.jpg"
+   - "./calibration/calib_img/guvcview_image-32.jpg"
+   - "./calibration/calib_img/guvcview_image-33.jpg"
+   - "./calibration/calib_img/guvcview_image-34.jpg"
+   - "./calibration/calib_img/guvcview_image-4.jpg"
+   - "./calibration/calib_img/guvcview_image-5.jpg"
+   - "./calibration/calib_img/guvcview_image-6.jpg"
+   - "./calibration/calib_img/guvcview_image-7.jpg"
+   - "./calibration/calib_img/guvcview_image-8.jpg"
+   - "./calibration/calib_img/guvcview_image-9.jpg"
