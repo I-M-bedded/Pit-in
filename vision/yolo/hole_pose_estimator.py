@@ -92,6 +92,10 @@ _CANONICAL_CENTER_OFFSET_M = {
 # Case-2b enumerates subsets of these to match any mixed detection cloud
 # (guides + low-confidence center all count as observation candidates).
 _BOARD_OFFSETS_M = np.array([-0.22, -0.08, 0.0, 0.08, 0.22], dtype=np.float64)
+_BOARD_CENTER_OFFSET_TOL_M = 1e-9
+_BOARD_CLASS_MISMATCH_PX = 8.0
+_BOARD_LINE_WEIGHT = 0.05
+_BOARD_PRIOR_WEIGHT = 0.35
 _CASE2B_CLUSTER_DIST_M = 0.04
 _CASE2B_RESCUE_WEIGHT = 0.65
 
@@ -107,16 +111,41 @@ PNP_METHOD_NAMES = {
 }
 
 
-def load_intrinsics(path: Optional[Path], fx: float, fy: float, cx: float, cy: float,
-                    dist: list[float]) -> tuple[np.ndarray, np.ndarray]:
+def _read_opencv_yaml_intrinsics(path: Path) -> Optional[tuple[np.ndarray, np.ndarray, str]]:
+    try:
+        fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
+    except cv2.error:
+        return None
+    if not fs.isOpened():
+        return None
+    try:
+        k_node = fs.getNode("K")
+        d_node = fs.getNode("D")
+        if k_node.empty() or d_node.empty():
+            return None
+        camera_matrix = k_node.mat().astype(np.float64)
+        dist_coeffs = d_node.mat().astype(np.float64).reshape(-1)
+        model_node = fs.getNode("camera_model")
+        camera_model = model_node.string() if not model_node.empty() else "pinhole"
+        return camera_matrix, dist_coeffs, camera_model
+    finally:
+        fs.release()
+
+
+def load_intrinsics_with_model(path: Optional[Path], fx: float, fy: float, cx: float, cy: float,
+                               dist: list[float]) -> tuple[np.ndarray, np.ndarray, str]:
     if path is None:
         if min(fx, fy) <= 0:
             raise ValueError("Either --intrinsics or positive --fx/--fy/--cx/--cy must be provided.")
         camera_matrix = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
         dist_coeffs = np.array(dist, dtype=np.float64)
-        return camera_matrix, dist_coeffs
+        return camera_matrix, dist_coeffs, "pinhole"
 
     suffix = path.suffix.lower()
+    opencv_payload = _read_opencv_yaml_intrinsics(path)
+    if opencv_payload is not None:
+        return opencv_payload
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f) if suffix == ".json" else yaml.safe_load(f)
 
@@ -156,6 +185,13 @@ def load_intrinsics(path: Optional[Path], fx: float, fy: float, cx: float, cy: f
     else:
         dist_coeffs = np.zeros(5, dtype=np.float64)
 
+    camera_model = str(data.get("camera_model", data.get("distortion_model", "pinhole")))
+    return camera_matrix, dist_coeffs, camera_model
+
+
+def load_intrinsics(path: Optional[Path], fx: float, fy: float, cx: float, cy: float,
+                    dist: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    camera_matrix, dist_coeffs, _ = load_intrinsics_with_model(path, fx, fy, cx, cy, dist)
     return camera_matrix, dist_coeffs
 
 
@@ -383,16 +419,11 @@ class CenterHoleResult:
 class HolePoseEstimator:
     """Tiered real-time center-hole pose estimator.
 
-    Tier 1:
-        Use paired center detections and recover the inner-hole pose directly
-        from the fitted conic when both center classes agree.
-    Tier 2a:
-        Use a single reliable inner-center detection with conic recovery.
-        Outer-only center detections fall through to Tier 2b geometry matching.
-    Tier 2b:
-        Build hybrid 3-D hole anchors from boundary geometry and kp0 rescue,
-        cluster them by physical hole, then match the row against the board
-        template in metric camera space.
+    Current runtime order:
+    1. reliable center target: pinhole may use conic, otherwise IPPE
+    2. weak/missing center: assign visible detections to the board template and
+       solve one board-plane IPPE pose
+    3. legacy fallback: per-detection 3-D anchors + weighted row geometry
     """
 
 
@@ -402,7 +433,7 @@ class HolePoseEstimator:
     GUIDE_OUTER  = 3   # Hole_B         (circle d=0.040)
 
     OUTER_AR_THRESHOLD = 1.3   # aspect-ratio gate for slot verification
-    INNER_ALONE_CONF   = 0.8   # inner-only conic trigger in Case 2a
+    INNER_ALONE_CONF   = 0.8   # high-confidence center target trigger
     CONIC_CENTER_GATE_PX = 18.0
 
     def __init__(
@@ -417,10 +448,11 @@ class HolePoseEstimator:
         sigma: float = 20.0,
         half: bool = False,
         imgsz: int = 640,
+        camera_model: str = "pinhole",
     ):
         self.model = YOLO(weights_path)
-        self.K = camera_matrix
-        self.dist = dist_coeffs
+        self.K = np.asarray(camera_matrix, dtype=np.float64)
+        self.dist = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
         self.device = device
         self.conf_threshold = conf_threshold
         self.kp_conf = kp_conf
@@ -428,6 +460,8 @@ class HolePoseEstimator:
         self.sigma = sigma
         self.half = half
         self.imgsz = imgsz
+        self.camera_model = camera_model
+        self.is_fisheye = camera_model.lower() in {"opencv_fisheye", "fisheye"}
 
         # Warm-up: compile CUDA kernels and TensorRT context before live frames
         _dummy = np.zeros((imgsz, imgsz, 3), dtype=np.uint8)
@@ -470,16 +504,133 @@ class HolePoseEstimator:
 
         detections = self._parse_detections(r)
 
-        # --- Tier 1 ---
-        t1 = self._tier1_conic(detections)
-        if t1 is not None:
-            t1.detections = detections
-            return t1
+        # --- Tier C: reliable center target ---
+        center_result = self._estimate_center_high(detections)
+        if center_result is not None:
+            center_result.detections = detections
+            return center_result
 
-        # --- Tier 2 ---
-        t2 = self._tier2_line_fitting(detections, prior_xy, prior_tvec_cam)
-        t2.detections = detections
-        return t2
+        # --- Tier B: weak/missing center, solve the whole board plane ---
+        board_result = self._estimate_board_ippe(detections, prior_xy, prior_tvec_cam)
+        if board_result is not None:
+            board_result.detections = detections
+            return board_result
+
+        # --- Legacy fallback: per-detection anchors + 3-D row geometry ---
+        legacy_result = self._tier2_line_fitting(detections, prior_xy, prior_tvec_cam)
+        legacy_result.detections = detections
+        return legacy_result
+
+    def project_cam_to_pixel(self, pt_cam: np.ndarray) -> Optional[np.ndarray]:
+        return self._project_cam_to_pixel(pt_cam)
+
+    # ------------------------------------------------------------------
+    #  Common top-level tiers
+    # ------------------------------------------------------------------
+
+    def _estimate_center_high(self, dets: List[dict]) -> Optional[CenterHoleResult]:
+        """Use the center target when the detector says it is reliable.
+
+        Pinhole keeps the conic option for the inner circle because it can be
+        more accurate than point-template PnP. Fisheye skips conics entirely
+        and uses IPPE on undistorted keypoints.
+        """
+        inner = self._best_of_class(dets, self.CENTER_INNER)
+        outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
+
+        pair_reliability = 0.0
+        if inner is not None and outer is not None:
+            pair_dist_px = float(np.linalg.norm(outer["kp0_xy"] - inner["kp0_xy"]))
+            pair_reliability = (
+                float(outer["conf"]) * float(inner["conf"])
+                / (1.0 + pair_dist_px / self.sigma)
+            )
+
+        target = None
+        confidence = 0.0
+        if inner is not None and pair_reliability >= self.reliability_threshold:
+            target = inner
+            confidence = pair_reliability
+        elif inner is not None and float(inner["conf"]) >= self.INNER_ALONE_CONF:
+            target = inner
+            confidence = float(inner["conf"]) * 0.8
+        elif outer is not None and float(outer["conf"]) >= self.INNER_ALONE_CONF:
+            target = outer
+            confidence = float(outer["conf"]) * 0.7
+
+        if target is None:
+            return None
+
+        if not self.is_fisheye and target["class_id"] == self.CENTER_INNER:
+            conic_result = self._estimate_center_conic(target, confidence)
+            if conic_result is not None:
+                return conic_result
+
+        pose = self._solve_for(target, target["kp0_xy"], include_center=True, ippe_only=True)
+        return self._center_result_from_pose(
+            target,
+            pose,
+            confidence=confidence,
+            source="center_ippe",
+        )
+
+    def _estimate_center_conic(
+        self,
+        det: dict,
+        confidence: float,
+    ) -> Optional[CenterHoleResult]:
+        if det["ellipse"] is None:
+            return None
+        spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[det["class_id"]]]
+        if spec["shape"] != "circle":
+            return None
+        radius = float(spec["size"]) / 2.0
+        pose = conic_to_pose(det["ellipse"], self.K, radius)
+        if pose is None or not self._is_conic_center_sane(det, pose):
+            return None
+        center_xy = np.array(pose["corrected_xy"], dtype=np.float64)
+        pose = dict(pose)
+        pose["source"] = "center_conic"
+        pose["camera_model"] = self.camera_model
+        return CenterHoleResult(
+            center_xy=center_xy,
+            confidence=float(confidence),
+            source="center_conic",
+            pose=pose,
+        )
+
+    def _center_result_from_pose(
+        self,
+        det: dict,
+        pose: Optional[dict],
+        *,
+        confidence: float,
+        source: str,
+    ) -> Optional[CenterHoleResult]:
+        if pose is None:
+            return None
+        class_name = CLASS_ID_TO_NAME[det["class_id"]]
+        canonical = self._canonical_center_from_pose(class_name, pose)
+        if canonical is None:
+            return None
+
+        _, hole_center = canonical
+        center_xy = self._project_cam_to_pixel(hole_center)
+        if center_xy is None:
+            return None
+
+        pose = dict(pose)
+        pose["surface_tvec_m"] = pose["tvec_m"]
+        pose["tvec_m"] = hole_center.tolist()
+        pose["xyz_m"] = hole_center.tolist()
+        pose["source"] = source
+        pose["camera_model"] = self.camera_model
+        return CenterHoleResult(
+            center_xy=center_xy,
+            confidence=float(confidence),
+            source=source,
+            pose=pose,
+        )
 
     # ------------------------------------------------------------------
     #  Detection parsing
@@ -523,44 +674,7 @@ class HolePoseEstimator:
         return list(center_by_cls.values()) + guides
 
     # ------------------------------------------------------------------
-    #  Tier 1 - paired center detections with inner-hole conic recovery
-    # ------------------------------------------------------------------
-
-    def _tier1_conic(self, dets: List[dict]) -> Optional[CenterHoleResult]:
-        outer = self._best_of_class(dets, self.CENTER_OUTER, verify_ar=True)
-        inner = self._best_of_class(dets, self.CENTER_INNER)
-        if outer is None or inner is None:
-            return None
-        if outer["ellipse"] is None or inner["ellipse"] is None:
-            return None
-
-        # Tier-1 gating should compare the detector's own center predictions.
-        # Using ellipse centers here over-penalizes perspective bias.
-        oc = outer["kp0_xy"]
-        ic = inner["kp0_xy"]
-        dist_px = float(np.linalg.norm(oc - ic))
-
-        reliability = outer["conf"] * inner["conf"] / (1.0 + dist_px / self.sigma)
-        if reliability < self.reliability_threshold:
-            return None
-
-        # Inner is a circle, so use the closed-form conic pose directly.
-        inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
-        inner_radius = float(inner_spec["size"]) / 2.0
-        pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
-        if pose is not None and self._is_conic_center_sane(inner, pose):
-            center_xy = np.array(pose["corrected_xy"], dtype=np.float64)
-            source = "conic"
-        else:
-            # Graceful fallback when conic is degenerate or over-corrected.
-            center_xy = ic.copy()
-            source = "kp0"
-            pose = self._solve_for(inner, center_xy)
-        return CenterHoleResult(center_xy=center_xy, confidence=reliability,
-                                source=source, pose=pose)
-
-    # ------------------------------------------------------------------
-    #  Tier 2 - fallback hierarchy
+    #  Legacy fallback hierarchy
     # ------------------------------------------------------------------
 
     def _tier2_line_fitting(
@@ -570,32 +684,7 @@ class HolePoseEstimator:
         prior_tvec_cam: Optional[np.ndarray] = None,
     ) -> CenterHoleResult:
         # ------------------------------------------------------------------
-        # Case 2a: single reliable inner-center detection.
-        #
-        # Inner is a true circle, so conic recovery is the preferred path.
-        # Outer center slots are not used as a standalone 2a pose source; they
-        # continue into Case 2b where the row geometry can constrain them.
-        # ------------------------------------------------------------------
-        # Case 2a: reliable inner center alone -> conic recovery.
-        inner = self._best_of_class(dets, self.CENTER_INNER)
-        if (inner is not None
-                and inner["ellipse"] is not None
-                and inner["conf"] >= self.INNER_ALONE_CONF):
-            inner_spec = GEOMETRY_SPECS[CLASS_ID_TO_NAME[inner["class_id"]]]
-            inner_radius = float(inner_spec["size"]) / 2.0
-            pose = conic_to_pose(inner["ellipse"], self.K, inner_radius)
-            if pose is not None and self._is_conic_center_sane(inner, pose):
-                center = np.array(pose["corrected_xy"], dtype=np.float64)
-                source = "conic"
-            else:
-                center = inner["kp0_xy"].copy()
-                source = "kp0"
-                pose = self._solve_for(inner, center)
-            return CenterHoleResult(center_xy=center, confidence=inner["conf"] * 0.8,
-                                    source=source, pose=pose)
-
-        # ------------------------------------------------------------------
-        # Case 2b: final fallback for weak center detections.
+        # Final fallback for weak center/board observations.
         #
         # Each detection first tries a boundary-only pose. When contour support
         # is weak, kp0 can rescue the anchor through a separate PnP solve.
@@ -651,6 +740,208 @@ class HolePoseEstimator:
             source="line",
             pose=pose,
         )
+
+    # ------------------------------------------------------------------
+    #  Board-level IPPE fallback
+    # ------------------------------------------------------------------
+
+    def _estimate_board_ippe(
+        self,
+        dets: List[dict],
+        prior_xy: Optional[np.ndarray] = None,
+        prior_tvec_cam: Optional[np.ndarray] = None,
+    ) -> Optional[CenterHoleResult]:
+        candidates = self._board_observation_candidates(dets)
+        if len(candidates) < 2:
+            return None
+
+        centers_rect = np.stack([c["center_rect"] for c in candidates], axis=0)
+        weights = np.array([c["weight"] for c in candidates], dtype=np.float64)
+        line = self._fit_weighted_image_line(centers_rect, weights)
+        if line is None:
+            return None
+        line_origin, line_dir = line
+
+        max_subset = min(len(candidates), len(_BOARD_OFFSETS_M))
+        subset_sizes = range(max_subset, 1, -1)
+        best: Optional[tuple] = None
+
+        for subset_size in subset_sizes:
+            for subset in itertools.combinations(candidates, subset_size):
+                ordered = sorted(
+                    subset,
+                    key=lambda item: float(np.dot(item["center_rect"] - line_origin, line_dir)),
+                )
+                for ordered_try in (ordered, list(reversed(ordered))):
+                    for offsets in itertools.combinations(_BOARD_OFFSETS_M, subset_size):
+                        hypothesis = self._solve_board_assignment(
+                            ordered_try,
+                            np.array(offsets, dtype=np.float64),
+                            line_origin,
+                            line_dir,
+                            prior_xy,
+                            prior_tvec_cam,
+                        )
+                        if hypothesis is None:
+                            continue
+                        if best is None or hypothesis[0] < best[0]:
+                            best = hypothesis
+            if best is not None:
+                break
+
+        if best is None:
+            return None
+
+        score, pose, center_xy, mean_conf = best
+        reproj = float(pose.get("reprojection_error_px", 10.0))
+        reproj_gain = 1.0 / (1.0 + reproj / 2.0)
+        score_gain = 1.0 / (1.0 + score / 10.0)
+        confidence = mean_conf * reproj_gain * score_gain
+        return CenterHoleResult(
+            center_xy=center_xy,
+            confidence=float(confidence),
+            source="board_ippe",
+            pose=pose,
+        )
+
+    def _board_observation_candidates(self, dets: List[dict]) -> List[dict]:
+        candidates = []
+        for idx, det in enumerate(dets):
+            if det["kp0_conf"] < self.kp_conf:
+                continue
+            center_rect = self._undistorted_pixel_points(det["kp0_xy"].reshape(1, 2))
+            if center_rect is None:
+                continue
+            boundary_support = float(np.count_nonzero(det["kpts_conf"][1:] >= self.kp_conf)) / 8.0
+            weight = float(det["conf"]) * (0.35 + 0.65 * boundary_support)
+            candidates.append({
+                "idx": idx,
+                "det": det,
+                "center_rect": center_rect.reshape(2),
+                "weight": max(weight, 1e-6),
+            })
+        return candidates
+
+    def _fit_weighted_image_line(
+        self,
+        points: np.ndarray,
+        weights: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        w_sum = float(weights.sum())
+        if len(points) < 2 or w_sum <= 0.0:
+            return None
+        w = weights / w_sum
+        mean = (w[:, None] * points).sum(axis=0)
+        centered = points - mean
+        cov = np.einsum("i,ij,ik->jk", w, centered, centered)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        if float(eigvals[-1]) <= 1e-12:
+            return None
+        direction = eigvecs[:, -1]
+        direction = direction / (np.linalg.norm(direction) + 1e-12)
+        return mean, direction
+
+    def _solve_board_assignment(
+        self,
+        ordered: List[dict],
+        offsets: np.ndarray,
+        line_origin: np.ndarray,
+        line_dir: np.ndarray,
+        prior_xy: Optional[np.ndarray],
+        prior_tvec_cam: Optional[np.ndarray],
+    ) -> Optional[tuple]:
+        object_points = []
+        image_points = []
+        confs = []
+        class_penalty = 0.0
+        line_residual = 0.0
+
+        for item, offset in zip(ordered, offsets):
+            det = item["det"]
+            valid = det["kpts_conf"] >= self.kp_conf
+            if np.count_nonzero(valid) < 2:
+                continue
+            local_obj = build_object_keypoints(det["class_id"]).astype(np.float64)
+            board_obj = local_obj.copy()
+            board_obj[:, 0] += float(offset)
+            object_points.append(board_obj[valid])
+            image_points.append(det["kpts_xy"][valid])
+            confs.append(float(det["conf"]))
+
+            residual_vec = item["center_rect"] - line_origin
+            along = float(np.dot(residual_vec, line_dir))
+            closest = line_origin + along * line_dir
+            line_residual += item["weight"] * float(np.linalg.norm(item["center_rect"] - closest))
+            class_penalty += self._board_class_assignment_penalty(det, float(offset))
+
+        if not object_points:
+            return None
+
+        obj = np.vstack(object_points)
+        img = np.vstack(image_points)
+        if len(obj) < 4:
+            return None
+
+        pose = solve_pose(
+            obj,
+            img,
+            self.K,
+            self.dist,
+            self.camera_model,
+            ippe_only=True,
+        )
+        if pose is None:
+            return None
+
+        center_tvec = np.array(pose["tvec_m"], dtype=np.float64)
+        center_xy = self._project_cam_to_pixel(center_tvec)
+        if center_xy is None:
+            return None
+
+        reproj = float(pose.get("reprojection_error_px", 10.0))
+        normalized_line_residual = line_residual / max(sum(item["weight"] for item in ordered), 1e-9)
+        score = reproj + _BOARD_LINE_WEIGHT * normalized_line_residual + class_penalty
+        if prior_tvec_cam is not None:
+            score += _BOARD_PRIOR_WEIGHT * float(np.linalg.norm(center_tvec - prior_tvec_cam))
+        elif prior_xy is not None:
+            score += 0.0005 * min(float(np.linalg.norm(center_xy - prior_xy)), 200.0)
+
+        pose = dict(pose)
+        pose["source"] = "board_ippe"
+        pose["camera_model"] = self.camera_model
+        pose["board_offsets_m"] = [float(v) for v in offsets]
+        pose["line_residual_px"] = float(normalized_line_residual)
+        pose["assignment_class_penalty"] = float(class_penalty)
+        pose["tvec_m"] = center_tvec.tolist()
+        pose["xyz_m"] = center_tvec.tolist()
+        mean_conf = float(np.mean(confs)) if confs else 0.0
+        return score, pose, center_xy, mean_conf
+
+    def _board_class_assignment_penalty(self, det: dict, offset: float) -> float:
+        is_center_class = det["class_id"] in (self.CENTER_INNER, self.CENTER_OUTER)
+        is_center_offset = abs(offset) <= _BOARD_CENTER_OFFSET_TOL_M
+        if is_center_class != is_center_offset:
+            return _BOARD_CLASS_MISMATCH_PX
+        return 0.0
+
+    def _undistorted_pixel_points(self, points_xy: np.ndarray) -> Optional[np.ndarray]:
+        pts = np.asarray(points_xy, dtype=np.float64).reshape(-1, 1, 2)
+        try:
+            if self.is_fisheye:
+                out = cv2.fisheye.undistortPoints(
+                    pts,
+                    self.K,
+                    self.dist.reshape(-1, 1),
+                    R=np.eye(3, dtype=np.float64),
+                    P=self.K,
+                )
+            elif self.dist.size > 0 and np.any(np.abs(self.dist) > 1e-12):
+                out = cv2.undistortPoints(pts, self.K, self.dist, P=self.K)
+            else:
+                out = pts
+        except cv2.error:
+            return None
+        return out.reshape(-1, 2).astype(np.float64)
 
     # ------------------------------------------------------------------
     #  Case 2b - hybrid anchor and weighted geometry helpers
@@ -921,10 +1212,27 @@ class HolePoseEstimator:
         return center_3d, residual, scale
 
     def _project_cam_to_pixel(self, pt_cam: np.ndarray) -> Optional[np.ndarray]:
-        """Pinhole project a 3-D camera-frame point to pixel (u, v) or None."""
+        """Project a 3-D camera-frame point to raw image pixel (u, v)."""
         Z = float(pt_cam[2])
         if Z <= 0.0:
             return None
+
+        if self.is_fisheye:
+            obj = np.asarray(pt_cam, dtype=np.float64).reshape(1, 1, 3)
+            rvec = np.zeros((3, 1), dtype=np.float64)
+            tvec = np.zeros((3, 1), dtype=np.float64)
+            try:
+                projected, _ = cv2.fisheye.projectPoints(
+                    obj,
+                    rvec,
+                    tvec,
+                    self.K,
+                    self.dist.reshape(-1, 1),
+                )
+            except cv2.error:
+                return None
+            return projected.reshape(2).astype(np.float64)
+
         fx = float(self.K[0, 0]); fy = float(self.K[1, 1])
         cx = float(self.K[0, 2]); cy = float(self.K[1, 2])
         return np.array(
@@ -1004,6 +1312,7 @@ class HolePoseEstimator:
         det: dict,
         center_xy: Optional[np.ndarray] = None,
         include_center: bool = True,
+        ippe_only: bool = False,
     ) -> Optional[dict]:
         obj = build_object_keypoints(det["class_id"])
         img = det["kpts_xy"].copy()
@@ -1013,35 +1322,82 @@ class HolePoseEstimator:
         valid[0] = bool(include_center)
         if valid.sum() < 4:
             return None
-        return solve_pose(obj[valid], img[valid], self.K, self.dist)
+        return solve_pose(obj[valid], img[valid], self.K, self.dist, self.camera_model, ippe_only=ippe_only)
 
 
 def solve_pose(object_points: np.ndarray, image_points: np.ndarray,
-               camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> Optional[dict]:
-    methods = []
-    if len(object_points) >= 4 and np.allclose(object_points[:, 2], object_points[0, 2]):
-        methods.append(cv2.SOLVEPNP_IPPE)
-    methods.extend([cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_SQPNP])
-
+               camera_matrix: np.ndarray, dist_coeffs: np.ndarray,
+               camera_model: str = "pinhole",
+               ippe_only: bool = False) -> Optional[dict]:
     obj = np.ascontiguousarray(object_points.astype(np.float32))
     img = np.ascontiguousarray(image_points.astype(np.float32))
+    camera_model_l = camera_model.lower()
+    is_fisheye = camera_model_l in {"opencv_fisheye", "fisheye"}
+    is_planar = len(object_points) >= 4 and np.allclose(object_points[:, 2], object_points[0, 2])
+
+    if is_fisheye or ippe_only:
+        if not is_planar:
+            return None
+        methods = [cv2.SOLVEPNP_IPPE]
+    else:
+        methods = []
+        if is_planar:
+            methods.append(cv2.SOLVEPNP_IPPE)
+        methods.extend([cv2.SOLVEPNP_ITERATIVE, cv2.SOLVEPNP_SQPNP])
+
+    if is_fisheye:
+        try:
+            img_for_pnp = cv2.fisheye.undistortPoints(
+                img.reshape(-1, 1, 2).astype(np.float64),
+                camera_matrix.astype(np.float64),
+                np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1),
+                R=np.eye(3, dtype=np.float64),
+                P=None,
+            ).reshape(-1, 2).astype(np.float32)
+        except cv2.error:
+            return None
+        pnp_camera_matrix = np.eye(3, dtype=np.float64)
+        pnp_dist_coeffs = np.zeros(4, dtype=np.float64)
+    else:
+        img_for_pnp = img
+        pnp_camera_matrix = camera_matrix
+        pnp_dist_coeffs = dist_coeffs
 
     for method in methods:
         try:
-            ok, rvec, tvec = cv2.solvePnP(obj, img, camera_matrix, dist_coeffs, flags=method)
+            ok, rvec, tvec = cv2.solvePnP(
+                obj,
+                img_for_pnp,
+                pnp_camera_matrix,
+                pnp_dist_coeffs,
+                flags=method,
+            )
         except cv2.error:
             continue
         if not ok:
             continue
 
         rotation_matrix, _ = cv2.Rodrigues(rvec)
-        reproj, _ = cv2.projectPoints(obj, rvec, tvec, camera_matrix, dist_coeffs)
+        if is_fisheye:
+            try:
+                reproj, _ = cv2.fisheye.projectPoints(
+                    obj.reshape(-1, 1, 3).astype(np.float64),
+                    rvec,
+                    tvec,
+                    camera_matrix.astype(np.float64),
+                    np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1),
+                )
+            except cv2.error:
+                continue
+        else:
+            reproj, _ = cv2.projectPoints(obj, rvec, tvec, camera_matrix, dist_coeffs)
         reproj = reproj.reshape(-1, 2)
         reproj_err = float(np.sqrt(np.mean(np.sum((reproj - img) ** 2, axis=1))))
 
         return {
             "solver": int(method),
             "solver_name": PNP_METHOD_NAMES.get(int(method), f"METHOD_{int(method)}"),
+            "camera_model": camera_model,
             "rvec": rvec.reshape(-1).astype(float).tolist(),
             "tvec_m": tvec.reshape(-1).astype(float).tolist(),
             "xyz_m": tvec.reshape(-1).astype(float).tolist(),
@@ -1060,6 +1416,7 @@ def estimate_detection(
     keypoints: np.ndarray,
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
+    camera_model: str,
     center_source: str,
     kp_conf: float,
 ) -> dict:
@@ -1093,6 +1450,7 @@ def estimate_detection(
             image_points=image_points[valid_mask],
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
+            camera_model=camera_model,
         )
 
     result = {
@@ -1176,6 +1534,7 @@ def run_on_image(
     image_path: Path,
     camera_matrix: np.ndarray,
     dist_coeffs: np.ndarray,
+    camera_model: str,
     preproc: str,
     conf: float,
     device: str,
@@ -1207,6 +1566,7 @@ def run_on_image(
                 keypoints=keypoints[det_idx],
                 camera_matrix=camera_matrix,
                 dist_coeffs=dist_coeffs,
+                camera_model=camera_model,
                 center_source=center_source,
                 kp_conf=kp_conf,
             )
@@ -1216,6 +1576,7 @@ def run_on_image(
     payload = {
         "image_path": str(image_path.resolve()),
         "preproc": preproc,
+        "camera_model": camera_model,
         "center_source": center_source,
         "detections": detections,
     }
@@ -1228,6 +1589,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--yolo-weights", type=Path, required=True, help="YOLO pose checkpoint")
     ap.add_argument("--coin-weights", type=Path, default=None, help="COIN module checkpoint")
     ap.add_argument("--intrinsics", type=Path, default=None, help="JSON/YAML with K and D")
+    ap.add_argument("--camera-model", choices=["auto", "pinhole", "opencv_fisheye", "fisheye"],
+                    default="auto")
     ap.add_argument("--fx", type=float, default=-1.0)
     ap.add_argument("--fy", type=float, default=-1.0)
     ap.add_argument("--cx", type=float, default=-1.0)
@@ -1246,7 +1609,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    camera_matrix, dist_coeffs = load_intrinsics(args.intrinsics, args.fx, args.fy, args.cx, args.cy, args.dist)
+    camera_matrix, dist_coeffs, detected_camera_model = load_intrinsics_with_model(
+        args.intrinsics,
+        args.fx,
+        args.fy,
+        args.cx,
+        args.cy,
+        args.dist,
+    )
+    camera_model = detected_camera_model if args.camera_model == "auto" else args.camera_model
     model = load_model(args.yolo_weights, args.device, args.coin_weights)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1258,6 +1629,7 @@ def main() -> None:
             image_path=image_path,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
+            camera_model=camera_model,
             preproc=args.preproc,
             conf=args.conf,
             device=args.device,

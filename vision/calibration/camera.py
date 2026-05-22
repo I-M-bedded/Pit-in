@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation as R
 # --- 설정값 ---
 MARKER_SIZE = 0.05  # 마커 크기 (미터)
 ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
-TOPIC_NAMESPACE = '/cam0'
+TOPIC_NAMESPACE = '/cam1'
 FRAME_ID = 'camera_color_optical_frame'
 
 class ArucoRealsenseNode(Node):
@@ -22,7 +22,7 @@ class ArucoRealsenseNode(Node):
         # RealSense 설정
         self.pipeline = rs.pipeline()
         config = rs.config()
-        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 6)
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         self.profile = self.pipeline.start(config)
         
         # 카메라 파라미터 획득

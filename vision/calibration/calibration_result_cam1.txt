@@ -1,0 +1,14 @@
+side: right
+topic: /cam1
+csv: /home/pitin/Desktop/pitin/Pit-in/vision/calibration/Calibration_data_cam1.csv
+solver: roll_+180_yaw_-90
+loss: soft_l1
+mean_xy_error_cm: 2.353949
+std_xy_error_cm: 1.621381
+max_xy_error_cm: 10.778931
+cost: 93.394637506
+euler_xyz_deg: [138.466586   8.772473 149.403382]
+R_cam_to_pin:
+[[-0.85070256  0.29397042  0.43575973]
+ [ 0.50303632  0.69581833  0.51263176]
+ [-0.15251104  0.65530012 -0.73981223]]

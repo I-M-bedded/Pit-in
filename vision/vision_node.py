@@ -37,7 +37,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
 
-from hole_pose_estimator import CLASS_ID_TO_NAME, HolePoseEstimator
+from hole_pose_estimator import CLASS_ID_TO_NAME, HolePoseEstimator, load_intrinsics_with_model
 from world_tracker import WorldEstimate, WorldTracker
 
 try:
@@ -123,6 +123,8 @@ class VisionNode(Node):
         hz: float = 15.0,
         robot_version: int = 4,
         debug: bool = False,
+        intrinsics_path: Optional[str] = None,
+        camera_model: str = "auto",
     ):
         super().__init__(f"vision_node_{side}")
         self.side = side
@@ -166,9 +168,20 @@ class VisionNode(Node):
             [0.0, 0.0, 1.0],
         ], dtype=np.float64)
         D = np.array(intrin.coeffs[:5], dtype=np.float64)
+        detected_camera_model = "pinhole"
+        if intrinsics_path:
+            K, D, detected_camera_model = load_intrinsics_with_model(
+                Path(intrinsics_path),
+                fx=-1.0,
+                fy=-1.0,
+                cx=-1.0,
+                cy=-1.0,
+                dist=[],
+            )
+        selected_camera_model = detected_camera_model if camera_model == "auto" else camera_model
         self.get_logger().info(
             f"Intrinsics: fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-            f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}"
+            f"cx={K[0,2]:.1f} cy={K[1,2]:.1f} model={selected_camera_model}"
         )
 
         # -- YOLO estimator (warm-up happens inside __init__) --
@@ -180,6 +193,7 @@ class VisionNode(Node):
             conf_threshold=conf_threshold,
             half=half,
             imgsz=width,
+            camera_model=selected_camera_model,
         )
 
         # -- World-space EMA tracker --
@@ -289,10 +303,10 @@ class VisionNode(Node):
         tvec_cam = cam_to_world.T @ (prev_world - cam_origin)
         if tvec_cam[2] <= 0:
             return None, None
-        K = self.estimator.K
-        u = K[0, 0] * tvec_cam[0] / tvec_cam[2] + K[0, 2]
-        v = K[1, 1] * tvec_cam[1] / tvec_cam[2] + K[1, 2]
-        return np.array([u, v], dtype=np.float64), tvec_cam.astype(np.float64)
+        pixel = self.estimator.project_cam_to_pixel(tvec_cam)
+        if pixel is None:
+            return None, None
+        return pixel, tvec_cam.astype(np.float64)
 
     # ------------------------------------------------------------------
     #  Main loop
@@ -476,6 +490,10 @@ def main():
     ap.add_argument("--trt", action="store_true",
                     help="Auto-export .pt → TensorRT .engine before starting")
     ap.add_argument("--robot-version", type=int, default=4)
+    ap.add_argument("--intrinsics", type=str, default=None,
+                    help="Optional JSON/YAML intrinsics override. OpenCV fisheye YAML is supported.")
+    ap.add_argument("--camera-model", choices=["auto", "pinhole", "opencv_fisheye", "fisheye"],
+                    default="auto")
     ap.add_argument("--no-gui", action="store_true")
     ap.add_argument("--debug", action="store_true",
                     help="Per-frame detection log + richer GUI overlay")
@@ -508,6 +526,8 @@ def main():
         hz=args.hz,
         robot_version=args.robot_version,
         debug=args.debug,
+        intrinsics_path=args.intrinsics,
+        camera_model=args.camera_model,
     )
     try:
         rclpy.spin(node)

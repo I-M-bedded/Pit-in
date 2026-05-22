@@ -8,6 +8,10 @@ This document summarizes the current online hole-pose pipeline used by:
 - `vision/yolo/hole_pose_estimator.py`
 - `vision/yolo/world_tracker.py`
 
+For the fisheye-camera adaptation plan, including hand-eye calibration and
+raw-fisheye keypoint handling, see
+`vision/calibration/FISHEYE_HAND_EYE_AND_HOLE_POSE.md`.
+
 The estimator returns the 3-D position of the center hole in the camera frame.
 `VisionNode` then transforms that position into the robot/world frame and
 `WorldTracker` stabilizes it with an EMA in world coordinates.

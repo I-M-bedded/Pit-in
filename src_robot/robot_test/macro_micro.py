@@ -72,7 +72,7 @@ class ControlConfig:
 
     # Convergence thresholds (meter)
     macro_threshold: float = 0.005    # 5mm for macro approach
-    micro_threshold: float = 0.003     # 3mm for micro final success
+    micro_threshold: float = 0.001     # 1mm for micro final success
     pbvs_threshold:  float = 0.0003    # 0.3mm for PBVS convergence (DONE)
 
     # Settling / Wait Setting tolerances
